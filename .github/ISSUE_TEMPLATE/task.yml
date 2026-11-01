@@ -1,0 +1,19 @@
+name: 开发任务 / 功能建议
+description: 描述范围、契约和验收条件。
+body:
+  - type: input
+    id: milestone
+    attributes:
+      label: 里程碑 / 关联规划编号
+  - type: textarea
+    id: scope
+    attributes:
+      label: 问题、范围与输入输出
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收条件、验证方式与回退
+    validations:
+      required: true

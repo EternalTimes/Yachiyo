@@ -1,0 +1,23 @@
+name: 问题报告
+description: 报告可复现的问题；项目当前处于规划阶段。
+title: '[Bug] '
+body:
+  - type: markdown
+    attributes:
+      value: 请先脱敏，不要提供真实订阅、访问令牌、私钥或原始流量。
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / 提交与运行环境
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤、预期与实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 最小虚构配置与脱敏证据
