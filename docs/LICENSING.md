@@ -33,6 +33,8 @@ GPLv3 与 AGPLv3 的特定组合按双方第 13 条处理；不能直接把原 G
 
 直接链接或深度组合的 GUI / 插件需判断是否构成受覆盖作品；独立进程、HTTP、socket 等机制不自动决定法律边界。仅与代理进行普通网络通信的独立软件不因此当然全部变成 AGPL。项目不能承诺所有名称相近或外围搭配的产品都受本许可证约束。
 
+当前工作区引入的所有第三方依赖（包含直接依赖与传递依赖）的详细清单、固定版本、SPDX 许可证标识、功能用途与 AGPL-3.0-only 组合合规性分析详见 [DEPENDENCIES.md](DEPENDENCIES.md)。
+
 参考：[GNU 兼容性说明](https://www.gnu.org/licenses/license-compatibility.en.html)；[GNU FAQ 对程序组合的说明](https://www.gnu.org/licenses/gpl-faq.en.html#MereAggregation)。
 
 ## 5. 后续执行

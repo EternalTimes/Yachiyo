@@ -42,7 +42,7 @@ def check(root: Path) -> list[str]:
     if license_path.is_file() and 'GNU AFFERO GENERAL PUBLIC LICENSE' not in license_path.read_text():
         errors.append('LICENSE must identify the GNU AGPL')
     for path in sorted(root.rglob('*')):
-        if any(part in {'.git', '.venv', 'node_modules', '__pycache__', 'target', 'local', 'private'}
+        if any(part in {'.git', '.venv', 'node_modules', '__pycache__', 'target', 'local', 'private', '.agents'}
                for part in path.relative_to(root).parts):
             continue
         if path.suffix not in {'.md', '.py', '.yml', '.yaml'} or not path.is_file():
