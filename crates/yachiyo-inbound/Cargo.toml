@@ -1,0 +1,14 @@
+[package]
+name = "yachiyo-inbound"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+yachiyo-core = { path = "../yachiyo-core" }
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync"] }
+tracing = { workspace = true, features = ["std"] }
+thiserror = { workspace = true }
