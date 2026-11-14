@@ -5,6 +5,7 @@
 use std::net::{SocketAddr, TcpListener};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -35,8 +36,21 @@ pub struct ProxyProcess {
 }
 
 impl ProxyProcess {
-    /// Helper to find an unused ephemeral loopback port.
+    /// Helper to find an unused loopback port outside OS ephemeral ranges (20000..32000)
+    /// to avoid TOCTOU collisions with parallel tests and outbound client sockets.
     pub fn get_available_port() -> u16 {
+        static NEXT_PORT: AtomicU16 = AtomicU16::new(0);
+        const BASE: u16 = 20_000;
+        const SPAN: u16 = 12_000;
+
+        let pid_offset = ((std::process::id() as u16).wrapping_mul(131)) % SPAN;
+        for _ in 0..SPAN {
+            let seq = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
+            let candidate = BASE + ((pid_offset.wrapping_add(seq)) % SPAN);
+            if TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+                return candidate;
+            }
+        }
         let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind ephemeral port");
         listener
             .local_addr()
@@ -126,7 +140,10 @@ impl ProxyProcess {
         let ports_to_check: Vec<SocketAddr> = [mixed, socks, http].into_iter().flatten().collect();
 
         for addr in &ports_to_check {
-            wait_for_port(*addr, Duration::from_secs(5)).await?;
+            if let Err(err) = wait_for_port(&mut child, *addr, Duration::from_secs(5)).await {
+                let captured = logs.lock().await.join("\n");
+                return Err(format!("{err}\n--- proxy logs ---\n{captured}"));
+            }
         }
 
         Ok(Self {
@@ -236,13 +253,23 @@ impl Drop for ProxyProcess {
     }
 }
 
-async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> Result<(), String> {
+async fn wait_for_port(
+    child: &mut Child,
+    addr: SocketAddr,
+    timeout: Duration,
+) -> Result<(), String> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "Proxy process exited prematurely with status {} while waiting for {}",
+                status, addr
+            ));
+        }
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     Err(format!(
         "Timed out waiting for proxy port {} to become reachable",
