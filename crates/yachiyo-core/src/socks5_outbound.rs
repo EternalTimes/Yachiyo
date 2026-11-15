@@ -2,7 +2,6 @@
 
 //! Outbound SOCKS5 TCP dialer (RFC 1928 & RFC 1929) and outbound registry.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::io::{Error, ErrorKind};
 use std::net::IpAddr;
@@ -54,41 +53,7 @@ pub struct Socks5OutboundConfig {
     pub auth: Socks5Auth,
 }
 
-/// Outbound target implementation registered by name.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OutboundTarget {
-    Direct,
-    Reject,
-    Socks5(Socks5OutboundConfig),
-}
-
-/// Registry mapping named outbound policies from configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OutboundRegistry {
-    entries: HashMap<String, OutboundTarget>,
-}
-
-impl OutboundRegistry {
-    /// Creates an empty registry (only built-in `DIRECT` and `REJECT` policies exist).
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Inserts a named outbound target.
-    pub fn insert(&mut self, name: String, target: OutboundTarget) {
-        self.entries.insert(name, target);
-    }
-
-    /// Looks up a named outbound target.
-    pub fn get(&self, name: &str) -> Option<&OutboundTarget> {
-        self.entries.get(name)
-    }
-
-    /// Returns `true` if a named outbound exists.
-    pub fn contains(&self, name: &str) -> bool {
-        self.entries.contains_key(name)
-    }
-}
+pub use crate::group::{OutboundRegistry, OutboundTarget, ResolvedOutbound};
 
 /// Outbound SOCKS5 TCP dialer (RFC 1928 + RFC 1929).
 pub struct Socks5Dialer;

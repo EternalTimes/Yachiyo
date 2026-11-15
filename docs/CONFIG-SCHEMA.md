@@ -51,17 +51,32 @@
 
 - `level`（默认 `"info"`）：tracing 日志过滤指令；所有级别均严格遵守零载荷日志策略（不输出应用数据载荷）。
 
-### `outbounds`（YAC-008）
+### `outbounds`（YAC-008 & M2）
 
-以 `<name>: <outbound_config>` 映射定义命名出站节点，规则中的 `<POLICY>` 可直接引用此处定义的 `<name>`：
+以 `<name>: <outbound_config>` 映射定义命名出站节点与选择策略组，规则中的 `<POLICY>` 可直接引用此处定义的 `<name>`：
 
-- 名称约束：不能为空、不能包含空白或逗号，且不能使用保留策略名 `DIRECT` / `REJECT`（大小写不敏感）。
+- 名称约束：不能为空、仅由 ASCII 字母、数字、`-` 或 `_` 组成，且不能使用保留策略名 `DIRECT` / `REJECT`（大小写不敏感）。
 - 当前支持类型：
   - `type: socks5`：标准 SOCKS5 TCP 出站（支持 RFC 1928 无认证 `0x00` 与 RFC 1929 用户名/密码认证 `0x02`）。
     - `server`（必填，`string`）：上游 SOCKS5 地址（`host:port` 或 `[ipv6]:port`，端口范围 `1..=65535`）。
     - `username`（可选，`string`）：RFC 1929 用户名（1..=255 字节，不可为空）。
     - `password`（可选，`string`）：RFC 1929 密码（1..=255 字节，不可为空）。
     - 约束：`username` 与 `password` 必须同时提供或同时省略；日志与 `Debug` 输出会对 `password` 脱敏。
+  - `type: selector`（选择策略组）：静态或手动选择候选节点。
+    - `outbounds`（必填，`Vec<string>`）：非空候选出站列表（可引用其他已定义的出站节点或 `DIRECT` / `REJECT`）。
+    - `selected`（可选，`string`）：初始激活的目标（若省略则默认取 `outbounds` 首项；若指定则必须存在于 `outbounds` 列表中）。
+  - `type: url-test`（自动测速健康检查组）：根据定期 HTTP GET 探针结果选择延迟最低的可用候选节点。
+    - `outbounds`（必填，`Vec<string>`）：非空候选出站列表。
+    - `url`（可选，`string`，默认 `"http://cp.cloudflare.com/generate_204"`）：健康检查探活 HTTP URL。
+    - `interval_secs`（可选，`u64`，默认 `300`，必须 `> 0`）：探针执行间隔秒数。
+    - `timeout_secs`（可选，`u64`，默认 `5`，必须 `> 0`）：单次探活超时秒数。
+    - `tolerance_ms`（可选，`u64`，默认 `50`）：延迟容差阈值（毫秒）；仅当新最优候选比当前选定候选快超过容差时才切换，防止网络微小抖动引发频繁路由跳变。
+  - `type: fallback`（故障转移健康检查组）：按声明顺序选用首个处于可用状态的候选节点。
+    - `outbounds`（必填，`Vec<string>`）：非空候选出站列表（按优先级从前至后排列）。
+    - `url`（可选，`string`，默认 `"http://cp.cloudflare.com/generate_204"`）：健康检查探活 HTTP URL。
+    - `interval_secs`（可选，`u64`，默认 `300`，必须 `> 0`）：探针执行间隔秒数。
+    - `timeout_secs`（可选，`u64`，默认 `5`，必须 `> 0`）：单次探活超时秒数。
+- 依赖图与环路约束：出站组之间允许嵌套引用，但严禁形成环路（例如 A -> B -> A）或自引用，配置校验阶段会执行拓扑检测并在发现环路时立即拒绝。
 
 ## 3. 规则语义与求值顺序
 

@@ -2,7 +2,7 @@
 
 //! Versioned native YAML configuration schema and semantic validation.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
@@ -10,8 +10,12 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::address::TargetAddr;
+use crate::group::{
+    FallbackGroup, OutboundRegistry, OutboundTarget, SelectorGroup, UrlTestGroup,
+    parse_http_probe_url,
+};
 use crate::rule::{Policy, Rule, RuleError, RuleSet};
-use crate::socks5_outbound::{OutboundRegistry, OutboundTarget, Socks5Auth, Socks5OutboundConfig};
+use crate::socks5_outbound::{Socks5Auth, Socks5OutboundConfig};
 
 /// Supported native configuration schema version.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -106,7 +110,7 @@ struct RawConfig {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+#[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 enum RawOutboundConfig {
     Socks5 {
         server: String,
@@ -115,6 +119,47 @@ enum RawOutboundConfig {
         #[serde(default)]
         password: Option<String>,
     },
+    Selector {
+        outbounds: Vec<String>,
+        #[serde(default)]
+        selected: Option<String>,
+    },
+    UrlTest {
+        outbounds: Vec<String>,
+        #[serde(default = "default_health_check_url")]
+        url: String,
+        #[serde(default = "default_interval_secs")]
+        interval_secs: u64,
+        #[serde(default = "default_timeout_secs")]
+        timeout_secs: u64,
+        #[serde(default = "default_tolerance_ms")]
+        tolerance_ms: u64,
+    },
+    Fallback {
+        outbounds: Vec<String>,
+        #[serde(default = "default_health_check_url")]
+        url: String,
+        #[serde(default = "default_interval_secs")]
+        interval_secs: u64,
+        #[serde(default = "default_timeout_secs")]
+        timeout_secs: u64,
+    },
+}
+
+fn default_health_check_url() -> String {
+    crate::group::DEFAULT_HEALTH_CHECK_URL.to_string()
+}
+
+fn default_interval_secs() -> u64 {
+    crate::group::DEFAULT_HEALTH_CHECK_INTERVAL.as_secs()
+}
+
+fn default_timeout_secs() -> u64 {
+    crate::group::DEFAULT_HEALTH_CHECK_TIMEOUT.as_secs()
+}
+
+fn default_tolerance_ms() -> u64 {
+    crate::group::DEFAULT_URL_TEST_TOLERANCE.as_millis() as u64
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -340,10 +385,11 @@ impl Config {
             });
         }
 
-        let mut outbounds = OutboundRegistry::new();
-        for (name, raw_out) in raw.outbounds {
-            if name == "DIRECT" || name == "REJECT" {
-                return Err(ConfigError::ReservedOutboundName { name });
+        // 1. Pre-validate outbound names
+        let all_outbound_names: HashSet<String> = raw.outbounds.keys().cloned().collect();
+        for name in &all_outbound_names {
+            if name.eq_ignore_ascii_case("DIRECT") || name.eq_ignore_ascii_case("REJECT") {
+                return Err(ConfigError::ReservedOutboundName { name: name.clone() });
             }
             if name.is_empty()
                 || !name
@@ -351,11 +397,107 @@ impl Config {
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
             {
                 return Err(ConfigError::InvalidOutbound {
-                    name,
+                    name: name.clone(),
                     reason: "outbound name must consist of ASCII alphanumeric, '-' or '_'"
                         .to_string(),
                 });
             }
+        }
+
+        // 2. Validate outbound candidate references and build graph for cycle detection
+        let mut group_graph: HashMap<String, Vec<String>> = HashMap::new();
+        for (name, raw_out) in &raw.outbounds {
+            let candidates = match raw_out {
+                RawOutboundConfig::Socks5 { .. } => continue,
+                RawOutboundConfig::Selector { outbounds, .. }
+                | RawOutboundConfig::UrlTest { outbounds, .. }
+                | RawOutboundConfig::Fallback { outbounds, .. } => outbounds,
+            };
+
+            if candidates.is_empty() {
+                return Err(ConfigError::InvalidOutbound {
+                    name: name.clone(),
+                    reason: "outbounds list cannot be empty".to_string(),
+                });
+            }
+
+            let mut group_targets = Vec::new();
+            for target in candidates {
+                if target == name {
+                    return Err(ConfigError::InvalidOutbound {
+                        name: name.clone(),
+                        reason: "group cannot reference itself".to_string(),
+                    });
+                }
+                if target.eq_ignore_ascii_case("DIRECT") || target.eq_ignore_ascii_case("REJECT") {
+                    continue;
+                }
+                if !all_outbound_names.contains(target) {
+                    return Err(ConfigError::InvalidOutbound {
+                        name: name.clone(),
+                        reason: format!("references undefined outbound '{target}'"),
+                    });
+                }
+                group_targets.push(target.clone());
+            }
+            group_graph.insert(name.clone(), group_targets);
+        }
+
+        // 3. Detect cycles among outbound groups via DFS
+        {
+            fn dfs_cycle(
+                node: &str,
+                graph: &HashMap<String, Vec<String>>,
+                visited: &mut HashSet<String>,
+                on_stack: &mut HashSet<String>,
+                path: &mut Vec<String>,
+            ) -> Result<(), ConfigError> {
+                visited.insert(node.to_string());
+                on_stack.insert(node.to_string());
+                path.push(node.to_string());
+
+                if let Some(neighbors) = graph.get(node) {
+                    for neighbor in neighbors {
+                        if on_stack.contains(neighbor) {
+                            path.push(neighbor.clone());
+                            let cycle_str = path.join(" -> ");
+                            return Err(ConfigError::InvalidOutbound {
+                                name: node.to_string(),
+                                reason: format!(
+                                    "circular dependency detected in outbound groups: {cycle_str}"
+                                ),
+                            });
+                        }
+                        if !visited.contains(neighbor) {
+                            dfs_cycle(neighbor, graph, visited, on_stack, path)?;
+                        }
+                    }
+                }
+
+                path.pop();
+                on_stack.remove(node);
+                Ok(())
+            }
+
+            let mut visited = HashSet::new();
+            let mut on_stack = HashSet::new();
+            let mut path = Vec::new();
+            for group_name in group_graph.keys() {
+                if !visited.contains(group_name) {
+                    dfs_cycle(
+                        group_name,
+                        &group_graph,
+                        &mut visited,
+                        &mut on_stack,
+                        &mut path,
+                    )?;
+                }
+            }
+        }
+
+        // 4. Construct outbound registry entries
+        let mut outbounds = OutboundRegistry::new();
+        for (name, raw_out) in raw.outbounds {
             match raw_out {
                 RawOutboundConfig::Socks5 {
                     server,
@@ -404,6 +546,87 @@ impl Config {
                             auth,
                         }),
                     );
+                }
+                RawOutboundConfig::Selector {
+                    outbounds: candidates,
+                    selected,
+                } => {
+                    if let Some(ref sel) = selected {
+                        if !candidates.contains(sel) {
+                            return Err(ConfigError::InvalidOutbound {
+                                name: name.clone(),
+                                reason: format!(
+                                    "selected outbound '{sel}' is not present in outbounds list"
+                                ),
+                            });
+                        }
+                    }
+                    let group = SelectorGroup::new(name.clone(), candidates, selected);
+                    outbounds.insert(name, OutboundTarget::Selector(std::sync::Arc::new(group)));
+                }
+                RawOutboundConfig::UrlTest {
+                    outbounds: candidates,
+                    url,
+                    interval_secs,
+                    timeout_secs,
+                    tolerance_ms,
+                } => {
+                    if interval_secs == 0 {
+                        return Err(ConfigError::InvalidOutbound {
+                            name: name.clone(),
+                            reason: "interval_secs must be greater than 0".to_string(),
+                        });
+                    }
+                    if timeout_secs == 0 {
+                        return Err(ConfigError::InvalidOutbound {
+                            name: name.clone(),
+                            reason: "timeout_secs must be greater than 0".to_string(),
+                        });
+                    }
+                    parse_http_probe_url(&url).map_err(|e| ConfigError::InvalidOutbound {
+                        name: name.clone(),
+                        reason: format!("invalid health check url: {e}"),
+                    })?;
+                    let group = UrlTestGroup::new(
+                        name.clone(),
+                        candidates,
+                        url,
+                        Duration::from_secs(interval_secs),
+                        Duration::from_secs(timeout_secs),
+                        Duration::from_millis(tolerance_ms),
+                    );
+                    outbounds.insert(name, OutboundTarget::UrlTest(std::sync::Arc::new(group)));
+                }
+                RawOutboundConfig::Fallback {
+                    outbounds: candidates,
+                    url,
+                    interval_secs,
+                    timeout_secs,
+                } => {
+                    if interval_secs == 0 {
+                        return Err(ConfigError::InvalidOutbound {
+                            name: name.clone(),
+                            reason: "interval_secs must be greater than 0".to_string(),
+                        });
+                    }
+                    if timeout_secs == 0 {
+                        return Err(ConfigError::InvalidOutbound {
+                            name: name.clone(),
+                            reason: "timeout_secs must be greater than 0".to_string(),
+                        });
+                    }
+                    parse_http_probe_url(&url).map_err(|e| ConfigError::InvalidOutbound {
+                        name: name.clone(),
+                        reason: format!("invalid health check url: {e}"),
+                    })?;
+                    let group = FallbackGroup::new(
+                        name.clone(),
+                        candidates,
+                        url,
+                        Duration::from_secs(interval_secs),
+                        Duration::from_secs(timeout_secs),
+                    );
+                    outbounds.insert(name, OutboundTarget::Fallback(std::sync::Arc::new(group)));
                 }
             }
         }
@@ -704,5 +927,115 @@ rules:
             Config::from_yaml_str(partial_auth).unwrap_err(),
             ConfigError::InvalidOutbound { .. }
         ));
+    }
+
+    #[test]
+    fn test_outbound_groups_config_validation_and_resolution() {
+        let valid_groups = r#"
+schema_version: 1
+outbounds:
+  node_a:
+    type: socks5
+    server: 192.0.2.1:1080
+  node_b:
+    type: socks5
+    server: 192.0.2.2:1080
+  auto_test:
+    type: url-test
+    outbounds:
+      - node_a
+      - node_b
+    url: http://cp.cloudflare.com/generate_204
+    interval_secs: 180
+    timeout_secs: 4
+    tolerance_ms: 40
+  fallback_group:
+    type: fallback
+    outbounds:
+      - auto_test
+      - DIRECT
+  proxy_selector:
+    type: selector
+    outbounds:
+      - fallback_group
+      - node_a
+      - DIRECT
+    selected: fallback_group
+rules:
+  - MATCH,proxy_selector
+"#;
+        let cfg = Config::from_yaml_str(valid_groups).unwrap();
+        assert!(cfg.outbounds.contains("proxy_selector"));
+        assert!(cfg.outbounds.contains("fallback_group"));
+        assert!(cfg.outbounds.contains("auto_test"));
+
+        // Test resolution chain
+        let (leaf, chain) = cfg.outbounds.resolve_with_chain("proxy_selector").unwrap();
+        assert_eq!(chain[0], "proxy_selector");
+        assert_eq!(chain[1], "fallback_group");
+        assert_eq!(chain[2], "auto_test");
+        assert_eq!(chain[3], "node_a");
+        assert!(matches!(leaf, crate::group::ResolvedOutbound::Socks5(_)));
+
+        // Test circular dependency rejection
+        let circular = r#"
+schema_version: 1
+outbounds:
+  group1:
+    type: selector
+    outbounds: [group2]
+  group2:
+    type: fallback
+    outbounds: [group1]
+rules:
+  - MATCH,group1
+"#;
+        let err = Config::from_yaml_str(circular).unwrap_err();
+        match err {
+            ConfigError::InvalidOutbound { reason, .. } => {
+                assert!(reason.contains("circular dependency detected"));
+            }
+            other => panic!("expected circular dependency error, got {other:?}"),
+        }
+
+        // Test self-reference rejection
+        let self_ref = r#"
+schema_version: 1
+outbounds:
+  self_loop:
+    type: selector
+    outbounds: [self_loop]
+rules:
+  - MATCH,self_loop
+"#;
+        let err = Config::from_yaml_str(self_ref).unwrap_err();
+        match err {
+            ConfigError::InvalidOutbound { reason, .. } => {
+                assert!(reason.contains("group cannot reference itself"));
+            }
+            other => panic!("expected self-reference error, got {other:?}"),
+        }
+
+        // Test invalid selector 'selected' target
+        let invalid_sel = r#"
+schema_version: 1
+outbounds:
+  node:
+    type: socks5
+    server: 192.0.2.1:1080
+  my_sel:
+    type: selector
+    outbounds: [node]
+    selected: non_existent
+rules:
+  - MATCH,my_sel
+"#;
+        let err = Config::from_yaml_str(invalid_sel).unwrap_err();
+        match err {
+            ConfigError::InvalidOutbound { reason, .. } => {
+                assert!(reason.contains("not present in outbounds list"));
+            }
+            other => panic!("expected selected not in list error, got {other:?}"),
+        }
     }
 }

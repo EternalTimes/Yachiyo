@@ -124,6 +124,8 @@ pub fn spawn_sighup_reloader(
                 _ = sighup.recv() => {
                     match reload_from_file(&config_path, &baseline, &snapshot_tx) {
                         Ok(generation) => {
+                            let current_outbounds = Arc::clone(&snapshot_tx.borrow().outbounds);
+                            current_outbounds.spawn_health_checks(shutdown_rx.clone());
                             info!(
                                 generation = generation,
                                 path = %config_path.display(),
