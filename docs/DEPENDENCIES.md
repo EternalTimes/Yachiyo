@@ -2,7 +2,7 @@
 # 第三方依赖与 AGPL-3.0-only 许可证合规审计
 
 决策与依据参考：ADR-001（语言与运行时，见 docs/DECISIONS.md §2）、ADR-002（开源许可证，见 docs/DECISIONS.md §3）、docs/LICENSING.md。  
-审计日期：2026-11-14；基准版本：Yachiyo 0.1.0-alpha.0 (feat/m1-direct-slice)。
+审计日期：2026-11-15；基准版本：Yachiyo 0.1.0-alpha.0 (feat/m1-config-rules)。
 
 ---
 
@@ -22,17 +22,16 @@
 
 经过对根目录 `Cargo.toml`、`Cargo.lock` 以及各个子 crate (`yachiyo-core`, `yachiyo-inbound`, `yachiyo-cli`, `yachiyo-e2e`) 的深度审计：
 
-- **直接生产依赖 (Direct Production Dependencies)**：6 个 (`tokio`, `tracing`, `tracing-subscriber`, `clap`, `thiserror`, `anyhow`)。
+- **直接生产依赖 (Direct Production Dependencies)**：8 个 (`tokio`, `tracing`, `tracing-subscriber`, `clap`, `thiserror`, `anyhow`, `serde`, `serde_yml`)。
 - **直接测试依赖 (Direct Test Dependency)**：1 个 (`libc`)。
-- **解析锁定的第三方 crate 总数 (Total Third-Party Crates)**：39 个（连同 4 个项目内部 workspace crate，全图共 43 个包）。
+- **解析锁定的第三方 crate 总数 (Total Third-Party Crates)**：49 个（连同 4 个项目内部 workspace crate，全图共 53 个包；新增 `serde`, `serde_core`, `serde_derive`, `serde_yml`, `noyalib`, `equivalent`, `hashbrown`, `indexmap`, `rustc-hash`, `smallvec` 均为 `MIT OR Apache-2.0` / `Apache-2.0 OR MIT`）。
 - **许可证类型分布**：
-  - `MIT OR Apache-2.0`：24 个（包含 `clap`, `thiserror`, `anyhow`, `libc`, `proc-macro2`, `syn`, `quote` 等）
+  - `MIT OR Apache-2.0` / `Apache-2.0 OR MIT`：35 个（包含 `clap`, `thiserror`, `anyhow`, `serde`, `serde_yml`, `libc`, `proc-macro2`, `syn`, `quote`, `pin-project-lite` 等）
   - `MIT`：10 个（包含 `tokio`, `tracing`, `tracing-subscriber`, `bytes`, `mio`, `sharded-slab` 等）
   - `Unlicense OR MIT`：2 个（`aho-corasick`, `memchr`）
-  - `Apache-2.0 OR MIT`：1 个（`pin-project-lite`）
   - `(MIT OR Apache-2.0) AND Unicode-3.0`：1 个 (`unicode-ident`)
   - `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`：1 个 (`wasi`)
-- **合规评定**：**100% 审计通过**。所有 39 个第三方依赖均完全基于宽松自由软件许可证（Permissive Free Software Licenses）。所有依赖均具有 MIT 或同等宽松分支，不存在任何阻碍静态编译进 AGPL-3.0-only 可执行程序的冲突条款。
+- **合规评定**：**100% 审计通过**。所有 49 个第三方依赖均完全基于宽松自由软件许可证（Permissive Free Software Licenses）。所有依赖均具有 MIT 或同等宽松分支，不存在任何阻碍静态编译进 AGPL-3.0-only 可执行程序的冲突条款。
 
 ---
 
@@ -46,6 +45,8 @@
 | **clap** | `^4.5` | `4.6.7` | `MIT OR Apache-2.0` | `yachiyo-cli` (`derive`, `std`, `help`, `usage`) | 命令行参数解析与使用说明生成。支持 `--mixed`, `--socks`, `--http`, `--allow-lan` 等标志并提供严格格式校验 | **完全兼容**。双重许可任选其一。MIT 与 Apache-2.0 均获 FSF 明确确认为与 GNU GPLv3 / AGPLv3 兼容的宽松许可。 |
 | **thiserror** | `^2.0` | `2.0.21` | `MIT OR Apache-2.0` | `yachiyo-core` (default)<br>`yachiyo-inbound` (default)<br>`yachiyo-cli` (default) | 库级别强类型错误定义与 `Display` / `Error` 特征派生，构建标准且清晰的错误链体系 | **完全兼容**。双重许可。过程宏生成代码与库本身均符合 AGPL 衍生作品要求。 |
 | **anyhow** | `^1.0` | `1.0.104` | `MIT OR Apache-2.0` | `yachiyo-cli` (`std`) | CLI 顶层动态错误传播与上下文附加（ADR-001 规划之用） | **完全兼容**。双重许可，完全兼容 AGPL-3.0-only。 |
+| **serde** | `^1.0` | `1.0.229` | `MIT OR Apache-2.0` | `yachiyo-core` (`derive`) | 原生配置结构体反序列化与 `deny_unknown_fields` 严格校验 | **完全兼容**。双重许可，完全兼容 AGPL-3.0-only。 |
+| **serde_yml** | `^0.0.13` | `0.0.13` | `MIT OR Apache-2.0` | `yachiyo-core` (default) | 原生 YAML 配置文件解析（配合文件体积、深度与别名防护） | **完全兼容**。双重许可，完全兼容 AGPL-3.0-only。 |
 | **libc** | `^0.2` | `0.2.191` | `MIT OR Apache-2.0` | `yachiyo-e2e` (default, 测试专用) | 端到端集成测试中向被测进程发送 Unix 原生信号（`SIGINT`/`SIGTERM`）以验证 5 秒优雅排空 | **完全兼容**。标准底层 FFI 绑定，双重许可，完全兼容。 |
 
 ---

@@ -5,6 +5,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -13,8 +14,8 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use yachiyo_core::{
-    ConnectionGuard, ConnectionTracker, TargetAddr, copy_bidirectional_with_idle_timeout,
-    dial_direct,
+    ConnMetadata, ConnectionGuard, ConnectionTracker, InboundKind, Network, Policy, RuleSet,
+    TargetAddr, copy_bidirectional_with_idle_timeout, dial_direct,
 };
 
 use crate::http::{self, HttpParseError};
@@ -47,6 +48,10 @@ pub struct InboundConfig {
     pub connect_timeout: Duration,
     /// Bidirectional forwarding idle timeout (300 seconds default).
     pub idle_timeout: Duration,
+    /// Ordered rule set for connection policy evaluation.
+    pub rules: Arc<RuleSet>,
+    /// Configuration generation active for this listener.
+    pub config_generation: u64,
 }
 
 impl Default for InboundConfig {
@@ -58,6 +63,8 @@ impl Default for InboundConfig {
             handshake_timeout: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(300),
+            rules: Arc::new(RuleSet::default_direct()),
+            config_generation: 0,
         }
     }
 }
@@ -312,9 +319,46 @@ async fn handle_inbound_connection(
         }
     };
 
-    // Phase 2: Direct Outbound Connection
-    info!(target = %target, protocol = ?protocol, peer = %peer_addr, "dialing direct outbound");
-    let dial_res = dial_direct(&target, config.connect_timeout).await;
+    // Phase 2: Build Connection Metadata & Evaluate Rules
+    let inbound_kind = match kind {
+        ListenerKind::Mixed => InboundKind::Mixed,
+        ListenerKind::Socks5 => InboundKind::Socks5,
+        ListenerKind::Http => InboundKind::Http,
+    };
+    let meta = ConnMetadata::new(
+        inbound_kind,
+        Network::Tcp,
+        target.clone(),
+        peer_addr,
+        config.config_generation,
+    );
+
+    let rule_match = config.rules.evaluate(&meta.target).await;
+    info!(
+        conn_id = meta.conn_id,
+        target = %meta.target,
+        protocol = ?protocol,
+        peer = %meta.peer_addr,
+        policy = %rule_match.policy,
+        rule = %rule_match.matched_rule,
+        "rule evaluated"
+    );
+
+    if rule_match.policy == Policy::Reject {
+        match protocol {
+            Protocol::Socks5 => {
+                let _ = socks5::send_rule_rejected_reply(&mut stream).await;
+            }
+            Protocol::HttpConnect => {
+                let _ = http::send_rule_rejected_reply(&mut stream).await;
+            }
+            Protocol::CleanClose => {}
+        }
+        return;
+    }
+
+    // Phase 3: Direct Outbound Connection
+    let dial_res = dial_direct(&meta.target, config.connect_timeout).await;
 
     let outbound = match dial_res {
         Ok(outbound) => outbound,

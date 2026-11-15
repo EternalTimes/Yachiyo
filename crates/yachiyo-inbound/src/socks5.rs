@@ -345,6 +345,14 @@ pub async fn send_error_reply<S: AsyncWrite + Unpin>(
     write_reply_for_io_error(stream, err).await
 }
 
+/// Transmits SOCKS5 rule-rejection reply (REP 0x02: connection not allowed by ruleset).
+#[inline]
+pub async fn send_rule_rejected_reply<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> Result<(), std::io::Error> {
+    write_reply(stream, RepCode::ConnectionNotAllowed).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

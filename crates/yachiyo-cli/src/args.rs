@@ -4,8 +4,11 @@
 
 use clap::Parser;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use yachiyo_core::connection::DEFAULT_MAX_CONNECTIONS;
+use yachiyo_core::{Config, ConfigError, RuleSet};
 use yachiyo_inbound::InboundConfig;
 
 /// Default mixed listener endpoint when no specific listener flags are provided.
@@ -60,6 +63,14 @@ pub struct CliArgs {
     /// Maximum concurrent connections allowed before rejection (default: 1024).
     #[arg(long, default_value_t = DEFAULT_MAX_CONNECTIONS, value_name = "LIMIT")]
     pub max_connections: usize,
+
+    /// Path to native YAML configuration file (schema_version: 1).
+    #[arg(short = 'c', long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
+
+    /// Validate configuration and CLI options, then exit without starting listeners.
+    #[arg(long)]
+    pub check: bool,
 }
 
 /// Resolved listener endpoints after evaluating defaults.
@@ -172,8 +183,59 @@ impl CliArgs {
             handshake_timeout: Duration::from_secs(self.handshake_timeout),
             connect_timeout: Duration::from_secs(self.connect_timeout),
             idle_timeout: Duration::from_secs(self.idle_timeout),
+            rules: Arc::new(RuleSet::default_direct()),
+            config_generation: 0,
         })
     }
+
+    /// Resolves full runtime configuration from either `--config <PATH>` or CLI flags.
+    pub fn resolve_runtime(&self) -> Result<RuntimeConfig, RuntimeConfigError> {
+        if let Some(ref path) = self.config {
+            let cfg = Config::from_file(path)?;
+            let inbound = InboundConfig {
+                mixed_addr: cfg.listeners.mixed,
+                socks_addr: cfg.listeners.socks,
+                http_addr: cfg.listeners.http,
+                handshake_timeout: cfg.timeouts.handshake,
+                connect_timeout: cfg.timeouts.connect,
+                idle_timeout: cfg.timeouts.idle,
+                rules: Arc::new(cfg.rules),
+                config_generation: 1,
+            };
+            Ok(RuntimeConfig {
+                inbound,
+                max_connections: cfg.limits.max_connections,
+                drain_timeout: cfg.timeouts.drain,
+                log_level: cfg.logging.level,
+            })
+        } else {
+            let inbound = self.to_inbound_config()?;
+            Ok(RuntimeConfig {
+                inbound,
+                max_connections: self.max_connections,
+                drain_timeout: crate::signal::DEFAULT_DRAIN_TIMEOUT,
+                log_level: self.log_level.clone(),
+            })
+        }
+    }
+}
+
+/// Unified runtime settings resolved from CLI flags or a native YAML configuration file.
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub inbound: InboundConfig,
+    pub max_connections: usize,
+    pub drain_timeout: Duration,
+    pub log_level: String,
+}
+
+/// Errors returned while resolving runtime configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeConfigError {
+    #[error(transparent)]
+    Args(#[from] ArgsError),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
 }
 
 #[cfg(test)]

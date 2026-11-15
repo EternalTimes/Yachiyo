@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Project Yachiyo 原生配置虚构样例（仅使用 RFC 2606 / RFC 5737 / RFC 3849 文档地址）
+
+schema_version: 1
+
+listeners:
+  mixed: 127.0.0.1:18484
+  allow_lan: false
+
+timeouts:
+  handshake_secs: 10
+  connect_secs: 10
+  idle_secs: 300
+  drain_secs: 5
+
+limits:
+  max_connections: 1024
+
+logging:
+  level: info
+
+rules:
+  - DOMAIN,ads.example.com,REJECT
+  - DOMAIN-SUFFIX,blocked.example.org,REJECT
+  - IP-CIDR,192.0.2.0/24,REJECT,no-resolve
+  - IP-CIDR,2001:db8::/32,REJECT,no-resolve
+  - MATCH,DIRECT
