@@ -14,8 +14,9 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use yachiyo_core::{
-    ConnMetadata, ConnectionGuard, ConnectionTracker, InboundKind, Network, Policy, RuleSet,
-    TargetAddr, copy_bidirectional_with_idle_timeout, dial_direct,
+    ConnMetadata, ConnectionGuard, ConnectionTracker, InboundKind, Network, OutboundRegistry,
+    OutboundTarget, Policy, RuleSet, Socks5Dialer, TargetAddr,
+    copy_bidirectional_with_idle_timeout, dial_direct,
 };
 
 use crate::http::{self, HttpParseError};
@@ -50,6 +51,8 @@ pub struct InboundConfig {
     pub idle_timeout: Duration,
     /// Ordered rule set for connection policy evaluation.
     pub rules: Arc<RuleSet>,
+    /// Named outbound registry (e.g. SOCKS5 upstream nodes).
+    pub outbounds: Arc<OutboundRegistry>,
     /// Configuration generation active for this listener.
     pub config_generation: u64,
 }
@@ -64,6 +67,7 @@ impl Default for InboundConfig {
             connect_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(300),
             rules: Arc::new(RuleSet::default_direct()),
+            outbounds: Arc::new(OutboundRegistry::new()),
             config_generation: 0,
         }
     }
@@ -344,21 +348,43 @@ async fn handle_inbound_connection(
         "rule evaluated"
     );
 
-    if rule_match.policy == Policy::Reject {
-        match protocol {
-            Protocol::Socks5 => {
-                let _ = socks5::send_rule_rejected_reply(&mut stream).await;
+    let dial_res = match &rule_match.policy {
+        Policy::Reject => {
+            match protocol {
+                Protocol::Socks5 => {
+                    let _ = socks5::send_rule_rejected_reply(&mut stream).await;
+                }
+                Protocol::HttpConnect => {
+                    let _ = http::send_rule_rejected_reply(&mut stream).await;
+                }
+                Protocol::CleanClose => {}
             }
-            Protocol::HttpConnect => {
-                let _ = http::send_rule_rejected_reply(&mut stream).await;
-            }
-            Protocol::CleanClose => {}
+            return;
         }
-        return;
-    }
-
-    // Phase 3: Direct Outbound Connection
-    let dial_res = dial_direct(&meta.target, config.connect_timeout).await;
+        Policy::Direct => dial_direct(&meta.target, config.connect_timeout).await,
+        Policy::Outbound(name) => match config.outbounds.get(name) {
+            Some(OutboundTarget::Direct) => dial_direct(&meta.target, config.connect_timeout).await,
+            Some(OutboundTarget::Reject) => {
+                match protocol {
+                    Protocol::Socks5 => {
+                        let _ = socks5::send_rule_rejected_reply(&mut stream).await;
+                    }
+                    Protocol::HttpConnect => {
+                        let _ = http::send_rule_rejected_reply(&mut stream).await;
+                    }
+                    Protocol::CleanClose => {}
+                }
+                return;
+            }
+            Some(OutboundTarget::Socks5(cfg)) => {
+                Socks5Dialer::dial(cfg, &meta.target, config.connect_timeout).await
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("undefined outbound policy '{name}'"),
+            )),
+        },
+    };
 
     let outbound = match dial_res {
         Ok(outbound) => outbound,

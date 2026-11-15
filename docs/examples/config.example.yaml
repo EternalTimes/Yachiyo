@@ -19,9 +19,17 @@ limits:
 logging:
   level: info
 
+outbounds:
+  lab_socks:
+    type: socks5
+    server: 192.0.2.1:1080
+    # username: demo-user
+    # password: demo-password
+
 rules:
   - DOMAIN,ads.example.com,REJECT
   - DOMAIN-SUFFIX,blocked.example.org,REJECT
+  - DOMAIN-SUFFIX,corp.example.com,lab_socks
   - IP-CIDR,192.0.2.0/24,REJECT,no-resolve
   - IP-CIDR,2001:db8::/32,REJECT,no-resolve
   - MATCH,DIRECT
