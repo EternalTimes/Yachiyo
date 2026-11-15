@@ -36,6 +36,10 @@ path = "tier5_config_rules.rs"
 name = "tier6_socks5_outbound"
 path = "tier6_socks5_outbound.rs"
 
+[[test]]
+name = "tier7_config_reload"
+path = "tier7_config_reload.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "process", "macros"] }
 tracing = { workspace = true, features = ["std"] }

@@ -81,10 +81,16 @@
    - 若目标为域名且指定了 `no-resolve`，则不触发 DNS 解析，直接跳过。
 4. `MATCH,<POLICY>`：显式默认动作，必须位于规则列表末尾。
 
-## 4. CLI 用法
+## 4. CLI 用法与配置快照重载
 
 - 校验配置而不启动监听：`yachiyo --config docs/examples/config.example.yaml --check`
 - 使用配置文件启动：`yachiyo --config docs/examples/config.example.yaml`
 - 不传 `--config` 时保持纯 CLI 参数模式，默认监听 `127.0.0.1:18484` 并将全部连接转发至 `DIRECT`。
+
+### 配置快照重载（`SIGHUP`，M2）
+
+使用 `--config` 启动时，向进程发送 `SIGHUP` 会触发原子快照重载：
+- 可热重载字段：`timeouts.handshake_secs`、`timeouts.connect_secs`、`timeouts.idle_secs`、`outbounds`、`rules`。重载成功后新连接立即使用新快照（`config_generation` 递增），已建立连接继续使用其接入时捕获的旧快照完成。
+- 需重启字段：`listeners`（监听地址）与 `limits.max_connections`。若这些字段发生变化或新配置解析/语义校验失败，本次重载会被拒绝并记录错误日志，**当前运行中的快照保持不变**。`logging.level` 变更同样需要重启才能生效，重载时会记录告警并保留当前日志级别。
 
 参考示例：[config.example.yaml](examples/config.example.yaml)。

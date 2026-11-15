@@ -4,6 +4,7 @@
 
 pub mod args;
 pub mod logging;
+pub mod reload;
 pub mod signal;
 
 pub use args::{
@@ -11,6 +12,7 @@ pub use args::{
     is_loopback_addr,
 };
 pub use logging::{LoggingError, build_env_filter, init_logging};
+pub use reload::{ReloadBaseline, ReloadError, reload_from_file};
 pub use signal::{
     DEFAULT_DRAIN_TIMEOUT, ShutdownOutcome, drain_connections, wait_for_signal,
     wait_for_signal_and_drain,

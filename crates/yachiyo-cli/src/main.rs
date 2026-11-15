@@ -10,6 +10,7 @@ use yachiyo_inbound::InboundListener;
 
 use yachiyo_cli::args::{ArgsError, CliArgs, RuntimeConfigError};
 use yachiyo_cli::logging;
+use yachiyo_cli::reload::{self, ReloadBaseline};
 use yachiyo_cli::signal;
 use yachiyo_core::ConfigError;
 
@@ -57,8 +58,9 @@ pub async fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // 5. Initialize connection concurrency tracker
+    // 5. Initialize connection concurrency tracker and reload baseline
     let tracker = ConnectionTracker::new(runtime.max_connections);
+    let reload_baseline = ReloadBaseline::from(&runtime);
 
     // 6. Bind inbound listener sockets (mixed, socks, and/or http)
     let listener = match InboundListener::bind(runtime.inbound, tracker.clone()).await {
@@ -70,6 +72,8 @@ pub async fn run() -> ExitCode {
         }
     };
 
+    let snapshot_tx = listener.snapshot_tx();
+
     for (kind, addr) in listener.local_addrs() {
         info!(kind = ?kind, addr = %addr, "listener active and ready for connections");
     }
@@ -77,7 +81,16 @@ pub async fn run() -> ExitCode {
     // 7. Initialize shutdown notification watch channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // 8. Spawn inbound listener accept loops in background task
+    // 8. Spawn SIGHUP config reloader (when --config is provided) and inbound accept loops
+    #[cfg(unix)]
+    if let Some(config_path) = args.config.clone() {
+        reload::spawn_sighup_reloader(
+            config_path,
+            reload_baseline,
+            snapshot_tx,
+            shutdown_rx.clone(),
+        );
+    }
     let server_handle = tokio::spawn(async move { listener.run(shutdown_rx).await });
 
     // 9. Coordinate server execution, termination signals, and graceful connection draining

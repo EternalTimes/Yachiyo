@@ -218,6 +218,22 @@ impl ProxyProcess {
         ))
     }
 
+    /// Send SIGHUP to the proxy process to trigger configuration snapshot reload.
+    #[cfg(unix)]
+    pub fn send_sighup(&self) -> Result<(), String> {
+        let child = self.child.as_ref().ok_or("No child process")?;
+        let pid = child.id().ok_or("Child process has no PID")?;
+        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "Failed to send SIGHUP: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
+    }
+
     /// Wait for the proxy process to exit with a given timeout.
     pub async fn wait_with_timeout(
         &mut self,

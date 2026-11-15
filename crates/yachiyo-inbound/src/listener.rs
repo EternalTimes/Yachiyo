@@ -57,6 +57,36 @@ pub struct InboundConfig {
     pub config_generation: u64,
 }
 
+/// Immutable runtime configuration snapshot captured per accepted connection.
+#[derive(Debug, Clone)]
+pub struct RuntimeSnapshot {
+    /// Inbound handshake timeout budget.
+    pub handshake_timeout: Duration,
+    /// Outbound dial timeout budget.
+    pub connect_timeout: Duration,
+    /// Bidirectional forwarding idle timeout.
+    pub idle_timeout: Duration,
+    /// Ordered rule set for connection policy evaluation.
+    pub rules: Arc<RuleSet>,
+    /// Named outbound registry (e.g. SOCKS5 upstream nodes).
+    pub outbounds: Arc<OutboundRegistry>,
+    /// Monotonically increasing configuration generation.
+    pub config_generation: u64,
+}
+
+impl From<&InboundConfig> for RuntimeSnapshot {
+    fn from(config: &InboundConfig) -> Self {
+        Self {
+            handshake_timeout: config.handshake_timeout,
+            connect_timeout: config.connect_timeout,
+            idle_timeout: config.idle_timeout,
+            rules: Arc::clone(&config.rules),
+            outbounds: Arc::clone(&config.outbounds),
+            config_generation: config.config_generation,
+        }
+    }
+}
+
 impl Default for InboundConfig {
     fn default() -> Self {
         Self {
@@ -112,7 +142,7 @@ where
 #[derive(Debug)]
 pub struct InboundListener {
     listeners: Vec<(ListenerKind, TcpListener)>,
-    config: InboundConfig,
+    snapshot_tx: watch::Sender<Arc<RuntimeSnapshot>>,
     tracker: ConnectionTracker,
 }
 
@@ -151,11 +181,18 @@ impl InboundListener {
             ));
         }
 
+        let (snapshot_tx, _) = watch::channel(Arc::new(RuntimeSnapshot::from(&config)));
+
         Ok(Self {
             listeners,
-            config,
+            snapshot_tx,
             tracker,
         })
+    }
+
+    /// Returns a handle for publishing updated runtime configuration snapshots.
+    pub fn snapshot_tx(&self) -> watch::Sender<Arc<RuntimeSnapshot>> {
+        self.snapshot_tx.clone()
     }
 
     /// Returns the local addresses of all active listeners.
@@ -172,11 +209,11 @@ impl InboundListener {
 
         for (kind, listener) in self.listeners {
             let rx = shutdown_rx.clone();
-            let config = self.config.clone();
+            let snapshot_rx = self.snapshot_tx.subscribe();
             let tracker = self.tracker.clone();
 
             join_set.spawn(async move {
-                accept_loop(kind, listener, config, tracker, rx).await;
+                accept_loop(kind, listener, snapshot_rx, tracker, rx).await;
             });
         }
 
@@ -196,7 +233,7 @@ impl InboundListener {
 async fn accept_loop(
     kind: ListenerKind,
     listener: TcpListener,
-    config: InboundConfig,
+    snapshot_rx: watch::Receiver<Arc<RuntimeSnapshot>>,
     tracker: ConnectionTracker,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
@@ -236,9 +273,9 @@ async fn accept_loop(
                     }
                 };
 
-                let conn_config = config.clone();
+                let conn_snapshot = snapshot_rx.borrow().clone();
                 tokio::spawn(async move {
-                    handle_inbound_connection(kind, stream, peer_addr, conn_config, guard).await;
+                    handle_inbound_connection(kind, stream, peer_addr, conn_snapshot, guard).await;
                 });
             }
             Ok(Err(e)) => {
@@ -260,7 +297,7 @@ async fn perform_handshake(
     kind: ListenerKind,
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
-    config: &InboundConfig,
+    config: &RuntimeSnapshot,
 ) -> Result<Option<(Protocol, TargetAddr, Option<Vec<u8>>)>, HandshakeError> {
     let protocol = match kind {
         ListenerKind::Socks5 => Protocol::Socks5,
@@ -299,7 +336,7 @@ async fn handle_inbound_connection(
     kind: ListenerKind,
     mut stream: TcpStream,
     peer_addr: SocketAddr,
-    config: InboundConfig,
+    config: Arc<RuntimeSnapshot>,
     _guard: ConnectionGuard,
 ) {
     // Phase 1: Inbound Handshake & Target Extraction (bounded by handshake_timeout)
