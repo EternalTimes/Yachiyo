@@ -2,14 +2,16 @@
 
 //! Versioned native YAML configuration schema and semantic validation.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::rule::{Rule, RuleError, RuleSet};
+use crate::address::TargetAddr;
+use crate::rule::{Policy, Rule, RuleError, RuleSet};
+use crate::socks5_outbound::{OutboundRegistry, OutboundTarget, Socks5Auth, Socks5OutboundConfig};
 
 /// Supported native configuration schema version.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -75,6 +77,15 @@ pub enum ConfigError {
 
     #[error("invalid ruleset: {0}")]
     InvalidRuleSet(#[from] RuleError),
+
+    #[error("outbound name '{name}' is reserved for built-in policy")]
+    ReservedOutboundName { name: String },
+
+    #[error("invalid outbound '{name}': {reason}")]
+    InvalidOutbound { name: String, reason: String },
+
+    #[error("rule at index {index} references undefined outbound '{name}'")]
+    UnknownOutboundReference { index: usize, name: String },
 }
 
 #[derive(Debug, Deserialize)]
@@ -89,7 +100,21 @@ struct RawConfig {
     limits: RawLimitsConfig,
     #[serde(default)]
     logging: RawLoggingConfig,
+    #[serde(default)]
+    outbounds: BTreeMap<String, RawOutboundConfig>,
     rules: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+enum RawOutboundConfig {
+    Socks5 {
+        server: String,
+        #[serde(default)]
+        username: Option<String>,
+        #[serde(default)]
+        password: Option<String>,
+    },
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -213,6 +238,7 @@ pub struct Config {
     pub timeouts: TimeoutsConfig,
     pub limits: LimitsConfig,
     pub logging: LoggingConfig,
+    pub outbounds: OutboundRegistry,
     pub rules: RuleSet,
 }
 
@@ -314,10 +340,86 @@ impl Config {
             });
         }
 
+        let mut outbounds = OutboundRegistry::new();
+        for (name, raw_out) in raw.outbounds {
+            if name == "DIRECT" || name == "REJECT" {
+                return Err(ConfigError::ReservedOutboundName { name });
+            }
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(ConfigError::InvalidOutbound {
+                    name,
+                    reason: "outbound name must consist of ASCII alphanumeric, '-' or '_'"
+                        .to_string(),
+                });
+            }
+            match raw_out {
+                RawOutboundConfig::Socks5 {
+                    server,
+                    username,
+                    password,
+                } => {
+                    let server_addr: TargetAddr =
+                        server.parse().map_err(|e| ConfigError::InvalidOutbound {
+                            name: name.clone(),
+                            reason: format!("invalid server address '{server}': {e}"),
+                        })?;
+                    if server_addr.port == 0 {
+                        return Err(ConfigError::InvalidOutbound {
+                            name,
+                            reason: "server port cannot be 0".to_string(),
+                        });
+                    }
+                    let auth = match (username, password) {
+                        (None, None) => Socks5Auth::None,
+                        (Some(u), Some(p)) => {
+                            if u.is_empty() || u.len() > 255 || p.is_empty() || p.len() > 255 {
+                                return Err(ConfigError::InvalidOutbound {
+                                    name,
+                                    reason:
+                                        "SOCKS5 username and password must each be 1..=255 bytes"
+                                            .to_string(),
+                                });
+                            }
+                            Socks5Auth::UsernamePassword {
+                                username: u,
+                                password: p,
+                            }
+                        }
+                        _ => {
+                            return Err(ConfigError::InvalidOutbound {
+                                name,
+                                reason: "username and password must both be specified together"
+                                    .to_string(),
+                            });
+                        }
+                    };
+                    outbounds.insert(
+                        name,
+                        OutboundTarget::Socks5(Socks5OutboundConfig {
+                            server: server_addr,
+                            auth,
+                        }),
+                    );
+                }
+            }
+        }
+
         let mut parsed_rules = Vec::with_capacity(raw.rules.len());
         for (index, line) in raw.rules.iter().enumerate() {
             let rule =
                 Rule::parse(line).map_err(|source| ConfigError::InvalidRule { index, source })?;
+            if let Policy::Outbound(ref out_name) = *rule.policy() {
+                if !outbounds.contains(out_name) {
+                    return Err(ConfigError::UnknownOutboundReference {
+                        index,
+                        name: out_name.clone(),
+                    });
+                }
+            }
             parsed_rules.push(rule);
         }
         let rules = RuleSet::new(parsed_rules)?;
@@ -342,6 +444,7 @@ impl Config {
             logging: LoggingConfig {
                 level: raw.logging.level,
             },
+            outbounds,
             rules,
         })
     }
@@ -542,6 +645,64 @@ rules:
         assert!(matches!(
             err,
             ConfigError::InvalidRuleSet(RuleError::MissingFinalMatch)
+        ));
+    }
+
+    #[test]
+    fn test_socks5_outbound_config_and_reference_validation() {
+        let yaml = r#"
+schema_version: 1
+outbounds:
+  upstream:
+    type: socks5
+    server: 192.0.2.1:1080
+    username: demo-user
+    password: demo-password
+rules:
+  - DOMAIN-SUFFIX,example.com,upstream
+  - MATCH,DIRECT
+"#;
+        let cfg = Config::from_yaml_str(yaml).unwrap();
+        assert!(cfg.outbounds.contains("upstream"));
+
+        let dangling = r#"
+schema_version: 1
+rules:
+  - DOMAIN,example.com,missing-node
+  - MATCH,DIRECT
+"#;
+        assert!(matches!(
+            Config::from_yaml_str(dangling).unwrap_err(),
+            ConfigError::UnknownOutboundReference { index: 0, .. }
+        ));
+
+        let reserved = r#"
+schema_version: 1
+outbounds:
+  DIRECT:
+    type: socks5
+    server: 192.0.2.1:1080
+rules:
+  - MATCH,DIRECT
+"#;
+        assert!(matches!(
+            Config::from_yaml_str(reserved).unwrap_err(),
+            ConfigError::ReservedOutboundName { .. }
+        ));
+
+        let partial_auth = r#"
+schema_version: 1
+outbounds:
+  upstream:
+    type: socks5
+    server: 192.0.2.1:1080
+    username: only-user
+rules:
+  - MATCH,upstream
+"#;
+        assert!(matches!(
+            Config::from_yaml_str(partial_auth).unwrap_err(),
+            ConfigError::InvalidOutbound { .. }
         ));
     }
 }

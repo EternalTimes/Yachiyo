@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use yachiyo_core::connection::DEFAULT_MAX_CONNECTIONS;
-use yachiyo_core::{Config, ConfigError, RuleSet};
+use yachiyo_core::{Config, ConfigError, OutboundRegistry, RuleSet};
 use yachiyo_inbound::InboundConfig;
 
 /// Default mixed listener endpoint when no specific listener flags are provided.
@@ -184,6 +184,7 @@ impl CliArgs {
             connect_timeout: Duration::from_secs(self.connect_timeout),
             idle_timeout: Duration::from_secs(self.idle_timeout),
             rules: Arc::new(RuleSet::default_direct()),
+            outbounds: Arc::new(OutboundRegistry::new()),
             config_generation: 0,
         })
     }
@@ -200,6 +201,7 @@ impl CliArgs {
                 connect_timeout: cfg.timeouts.connect,
                 idle_timeout: cfg.timeouts.idle,
                 rules: Arc::new(cfg.rules),
+                outbounds: Arc::new(cfg.outbounds),
                 config_generation: 1,
             };
             Ok(RuntimeConfig {

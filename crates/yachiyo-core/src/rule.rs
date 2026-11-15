@@ -12,10 +12,11 @@ use tracing::debug;
 use crate::address::{TargetAddr, TargetHost};
 
 /// Routing action selected by a rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Policy {
     Direct,
     Reject,
+    Outbound(String),
 }
 
 impl fmt::Display for Policy {
@@ -23,6 +24,7 @@ impl fmt::Display for Policy {
         match self {
             Self::Direct => write!(f, "DIRECT"),
             Self::Reject => write!(f, "REJECT"),
+            Self::Outbound(name) => write!(f, "{name}"),
         }
     }
 }
@@ -31,9 +33,18 @@ impl FromStr for Policy {
     type Err = RuleError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim() {
+        let trimmed = s.trim();
+        match trimmed {
             "DIRECT" => Ok(Self::Direct),
             "REJECT" => Ok(Self::Reject),
+            other
+                if !other.is_empty()
+                    && other
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') =>
+            {
+                Ok(Self::Outbound(other.to_string()))
+            }
             other => Err(RuleError::UnknownPolicy(other.to_string())),
         }
     }
@@ -147,7 +158,7 @@ pub enum RuleError {
     InvalidSyntax(String),
     #[error("unknown rule type: {0}")]
     UnknownRuleType(String),
-    #[error("unknown policy '{0}' (expected DIRECT or REJECT)")]
+    #[error("unknown policy '{0}' (expected DIRECT, REJECT, or a valid outbound name)")]
     UnknownPolicy(String),
     #[error("invalid domain pattern: {0}")]
     InvalidDomain(String),
@@ -252,12 +263,12 @@ impl Rule {
     }
 
     /// Returns the policy of this rule.
-    pub fn policy(&self) -> Policy {
+    pub fn policy(&self) -> &Policy {
         match self {
             Self::Domain { policy, .. }
             | Self::DomainSuffix { policy, .. }
             | Self::IpCidr { policy, .. }
-            | Self::Match { policy } => *policy,
+            | Self::Match { policy } => policy,
         }
     }
 }
@@ -346,7 +357,7 @@ impl RuleSet {
                         let norm = normalize_domain_for_match(dom);
                         if norm == *pattern {
                             return RuleMatch {
-                                policy: *policy,
+                                policy: policy.clone(),
                                 matched_rule: rule.to_string(),
                                 dns_resolved,
                             };
@@ -358,7 +369,7 @@ impl RuleSet {
                         let norm = normalize_domain_for_match(dom);
                         if domain_matches_suffix(&norm, suffix) {
                             return RuleMatch {
-                                policy: *policy,
+                                policy: policy.clone(),
                                 matched_rule: rule.to_string(),
                                 dns_resolved,
                             };
@@ -373,7 +384,7 @@ impl RuleSet {
                     TargetHost::Ip(ip) => {
                         if cidr.contains(*ip) {
                             return RuleMatch {
-                                policy: *policy,
+                                policy: policy.clone(),
                                 matched_rule: rule.to_string(),
                                 dns_resolved,
                             };
@@ -405,7 +416,7 @@ impl RuleSet {
                         };
                         if ips.iter().any(|ip| cidr.contains(*ip)) {
                             return RuleMatch {
-                                policy: *policy,
+                                policy: policy.clone(),
                                 matched_rule: rule.to_string(),
                                 dns_resolved,
                             };
@@ -414,7 +425,7 @@ impl RuleSet {
                 },
                 Rule::Match { policy } => {
                     return RuleMatch {
-                        policy: *policy,
+                        policy: policy.clone(),
                         matched_rule: rule.to_string(),
                         dns_resolved,
                     };
