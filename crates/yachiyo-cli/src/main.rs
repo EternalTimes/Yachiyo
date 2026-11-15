@@ -4,6 +4,7 @@
 
 use clap::Parser;
 use std::process::ExitCode;
+use std::sync::Arc;
 use tracing::{error, info};
 use yachiyo_core::connection::ConnectionTracker;
 use yachiyo_inbound::InboundListener;
@@ -61,6 +62,7 @@ pub async fn run() -> ExitCode {
     // 5. Initialize connection concurrency tracker and reload baseline
     let tracker = ConnectionTracker::new(runtime.max_connections);
     let reload_baseline = ReloadBaseline::from(&runtime);
+    let outbounds = Arc::clone(&runtime.inbound.outbounds);
 
     // 6. Bind inbound listener sockets (mixed, socks, and/or http)
     let listener = match InboundListener::bind(runtime.inbound, tracker.clone()).await {
@@ -81,7 +83,10 @@ pub async fn run() -> ExitCode {
     // 7. Initialize shutdown notification watch channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // 8. Spawn SIGHUP config reloader (when --config is provided) and inbound accept loops
+    // 8. Spawn background health checks for outbound groups
+    outbounds.spawn_health_checks(shutdown_rx.clone());
+
+    // 9. Spawn SIGHUP config reloader (when --config is provided) and inbound accept loops
     #[cfg(unix)]
     if let Some(config_path) = args.config.clone() {
         reload::spawn_sighup_reloader(

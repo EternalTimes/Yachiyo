@@ -9,6 +9,7 @@ pub mod config;
 pub mod connection;
 pub mod context;
 pub mod forward;
+pub mod group;
 pub mod outbound;
 pub mod rule;
 pub mod socks5_outbound;
@@ -20,8 +21,12 @@ pub use context::{ConnMetadata, InboundKind, Network};
 pub use forward::{
     DEFAULT_BUFFER_SIZE, DEFAULT_IDLE_TIMEOUT, TransferStats, copy_bidirectional_with_idle_timeout,
 };
+pub use group::{
+    DEFAULT_HEALTH_CHECK_INTERVAL, DEFAULT_HEALTH_CHECK_TIMEOUT, DEFAULT_HEALTH_CHECK_URL,
+    DEFAULT_URL_TEST_TOLERANCE, FallbackGroup, NodeHealth, OutboundRegistry, OutboundResolveError,
+    OutboundTarget, ProbeError, ResolvedOutbound, SelectorGroup, UrlTestGroup,
+    parse_http_probe_url, probe_candidate, probe_leaf,
+};
 pub use outbound::{DirectDialer, dial_direct};
 pub use rule::{IpCidr, Policy, Rule, RuleError, RuleMatch, RuleSet};
-pub use socks5_outbound::{
-    OutboundRegistry, OutboundTarget, Socks5Auth, Socks5Dialer, Socks5OutboundConfig,
-};
+pub use socks5_outbound::{Socks5Auth, Socks5Dialer, Socks5OutboundConfig};

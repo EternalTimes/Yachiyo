@@ -15,7 +15,7 @@ use tracing::{debug, error, info, warn};
 
 use yachiyo_core::{
     ConnMetadata, ConnectionGuard, ConnectionTracker, InboundKind, Network, OutboundRegistry,
-    OutboundTarget, Policy, RuleSet, Socks5Dialer, TargetAddr,
+    Policy, ResolvedOutbound, RuleSet, Socks5Dialer, TargetAddr,
     copy_bidirectional_with_idle_timeout, dial_direct,
 };
 
@@ -399,9 +399,9 @@ async fn handle_inbound_connection(
             return;
         }
         Policy::Direct => dial_direct(&meta.target, config.connect_timeout).await,
-        Policy::Outbound(name) => match config.outbounds.get(name) {
-            Some(OutboundTarget::Direct) => dial_direct(&meta.target, config.connect_timeout).await,
-            Some(OutboundTarget::Reject) => {
+        Policy::Outbound(name) => match config.outbounds.resolve(name) {
+            Ok(ResolvedOutbound::Direct) => dial_direct(&meta.target, config.connect_timeout).await,
+            Ok(ResolvedOutbound::Reject) => {
                 match protocol {
                     Protocol::Socks5 => {
                         let _ = socks5::send_rule_rejected_reply(&mut stream).await;
@@ -413,12 +413,12 @@ async fn handle_inbound_connection(
                 }
                 return;
             }
-            Some(OutboundTarget::Socks5(cfg)) => {
-                Socks5Dialer::dial(cfg, &meta.target, config.connect_timeout).await
+            Ok(ResolvedOutbound::Socks5(cfg)) => {
+                Socks5Dialer::dial(&cfg, &meta.target, config.connect_timeout).await
             }
-            None => Err(std::io::Error::new(
+            Err(e) => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                format!("undefined outbound policy '{name}'"),
+                format!("outbound resolution failed for '{name}': {e}"),
             )),
         },
     };
