@@ -109,6 +109,7 @@ async fn start_test_listener(
         handshake_timeout,
         connect_timeout: Duration::from_secs(5),
         idle_timeout: Duration::from_secs(300),
+        ..InboundConfig::default()
     };
     let tracker = ConnectionTracker::new(100);
     let listener = InboundListener::bind(config, tracker).await.unwrap();

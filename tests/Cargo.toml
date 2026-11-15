@@ -28,6 +28,10 @@ path = "tier3_cross_feature.rs"
 name = "tier4_real_world"
 path = "tier4_real_world.rs"
 
+[[test]]
+name = "tier5_config_rules"
+path = "tier5_config_rules.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "process", "macros"] }
 tracing = { workspace = true, features = ["std"] }

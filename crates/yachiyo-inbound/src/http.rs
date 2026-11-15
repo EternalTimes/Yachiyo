@@ -25,6 +25,7 @@ pub const MAX_HEADER_SIZE: usize = 8192;
 /// Standard HTTP responses
 pub const RESPONSE_200: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 pub const RESPONSE_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\r\n";
+pub const RESPONSE_403: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\r\n";
 pub const RESPONSE_405: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\r\n";
 pub const RESPONSE_431: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n";
 pub const RESPONSE_502: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\n\r\n";
@@ -279,6 +280,15 @@ pub async fn send_success_reply<S: AsyncWrite + Unpin>(
     stream: &mut S,
 ) -> Result<(), std::io::Error> {
     stream.write_all(RESPONSE_200).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Transmits `HTTP/1.1 403 Forbidden\r\n\r\n` when a connection is rejected by rules.
+pub async fn send_rule_rejected_reply<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+) -> Result<(), std::io::Error> {
+    stream.write_all(RESPONSE_403).await?;
     stream.flush().await?;
     Ok(())
 }

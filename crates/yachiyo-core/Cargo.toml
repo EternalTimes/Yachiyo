@@ -11,6 +11,8 @@ authors.workspace = true
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "rt"] }
 tracing = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_yml = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
