@@ -10,7 +10,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use yachiyo_cli::args::QueryCommand;
 use yachiyo_core::diagnostics::escape_json;
-use yachiyo_core::{ActiveConnSnapshot, DiagnosticsTracker, NodeHealthReport, OutboundRegistry};
+use yachiyo_core::{
+    ActiveConnSnapshot, DiagnosticsTracker, NodeHealthReport, OutboundRegistry, RuleSet,
+};
+use yachiyo_inbound::RuntimeSnapshot;
 
 /// Default filesystem path for the local Unix domain socket IPC endpoint.
 pub const DEFAULT_IPC_PATH: &str = "/tmp/yachiyo.sock";
@@ -45,7 +48,7 @@ pub struct IpcServer {
     listener: UnixListener,
     path: PathBuf,
     diagnostics: Arc<DiagnosticsTracker>,
-    outbounds: Arc<OutboundRegistry>,
+    snapshot_rx: tokio::sync::watch::Receiver<Arc<RuntimeSnapshot>>,
 }
 
 impl IpcServer {
@@ -56,18 +59,27 @@ impl IpcServer {
         diagnostics: Arc<DiagnosticsTracker>,
         outbounds: Arc<OutboundRegistry>,
     ) -> Result<Self, std::io::Error> {
-        Self::bind_with_fallback(path, true, diagnostics, outbounds).await
+        let initial_snapshot = Arc::new(RuntimeSnapshot {
+            handshake_timeout: std::time::Duration::from_secs(10),
+            connect_timeout: std::time::Duration::from_secs(10),
+            idle_timeout: std::time::Duration::from_secs(300),
+            rules: Arc::new(RuleSet::default_direct()),
+            outbounds,
+            config_generation: diagnostics.runtime_status().config_generation,
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(initial_snapshot);
+        Self::bind_with_snapshot(path, true, diagnostics, rx).await
     }
 
-    /// Binds the Unix domain socket at `path`.
+    /// Binds the Unix domain socket at `path` subscribed to live [`RuntimeSnapshot`] updates.
     ///
     /// If `is_custom` is false and the default socket `/tmp/yachiyo.sock` is already in use by another
     /// daemon instance, falls back to `/tmp/yachiyo-{pid}.sock` to prevent multi-instance / test collisions.
-    pub async fn bind_with_fallback(
+    pub async fn bind_with_snapshot(
         path: impl AsRef<Path>,
         is_custom: bool,
         diagnostics: Arc<DiagnosticsTracker>,
-        outbounds: Arc<OutboundRegistry>,
+        snapshot_rx: tokio::sync::watch::Receiver<Arc<RuntimeSnapshot>>,
     ) -> Result<Self, std::io::Error> {
         let mut target_path = path.as_ref().to_path_buf();
 
@@ -113,7 +125,7 @@ impl IpcServer {
             listener,
             path: target_path,
             diagnostics,
-            outbounds,
+            snapshot_rx,
         })
     }
 
@@ -141,9 +153,9 @@ impl IpcServer {
                     match accept_res {
                         Ok((stream, _)) => {
                             let diag = Arc::clone(&self.diagnostics);
-                            let out = Arc::clone(&self.outbounds);
+                            let snap_rx = self.snapshot_rx.clone();
                             tokio::spawn(async move {
-                                handle_client(stream, diag, out).await;
+                                handle_client(stream, diag, snap_rx).await;
                             });
                         }
                         Err(e) => {
@@ -166,7 +178,7 @@ impl IpcServer {
 async fn handle_client(
     stream: UnixStream,
     diagnostics: Arc<DiagnosticsTracker>,
-    outbounds: Arc<OutboundRegistry>,
+    snapshot_rx: tokio::sync::watch::Receiver<Arc<RuntimeSnapshot>>,
 ) {
     let (reader, mut writer) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(reader);
@@ -182,7 +194,9 @@ async fn handle_client(
                     continue;
                 }
 
-                let response = process_ipc_command(trimmed, &diagnostics, &outbounds);
+                let snap = snapshot_rx.borrow().clone();
+                diagnostics.set_config_generation(snap.config_generation);
+                let response = process_ipc_command(trimmed, &diagnostics, &snap.outbounds);
                 if let Err(e) = writer.write_all(format!("{response}\n").as_bytes()).await {
                     tracing::debug!(error = %e, "IPC write error");
                     break;
@@ -887,5 +901,70 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = srv_handle.await;
         let _ = std::fs::remove_file(&sock_path);
+    }
+
+    #[tokio::test]
+    async fn test_ipc_reflects_live_snapshot_reload() {
+        let sock_path = PathBuf::from(format!(
+            "/tmp/test_yachiyo_reload_ipc_{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&sock_path);
+
+        let diag = DiagnosticsTracker::new(64);
+        let initial_snap = Arc::new(RuntimeSnapshot {
+            handshake_timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(300),
+            rules: Arc::new(RuleSet::default_direct()),
+            outbounds: Arc::new(OutboundRegistry::new()),
+            config_generation: 1,
+        });
+        let (snap_tx, snap_rx) = tokio::sync::watch::channel(initial_snap);
+
+        let server = IpcServer::bind_with_snapshot(&sock_path, true, diag, snap_rx)
+            .await
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let srv_handle = tokio::spawn(async move {
+            server.run(shutdown_rx).await.unwrap();
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let status_v1 = send_command(&sock_path, "STATUS").await.unwrap();
+        assert!(status_v1.contains(r#""config_generation":1"#));
+
+        let parsed_cfg = yachiyo_core::Config::from_yaml_str(
+            r#"
+schema_version: 1
+outbounds:
+  reloaded_socks:
+    type: socks5
+    server: 192.0.2.99:1080
+rules:
+  - MATCH,reloaded_socks
+"#,
+        )
+        .unwrap();
+        snap_tx
+            .send(Arc::new(RuntimeSnapshot {
+                handshake_timeout: Duration::from_secs(10),
+                connect_timeout: Duration::from_secs(10),
+                idle_timeout: Duration::from_secs(300),
+                rules: Arc::new(parsed_cfg.rules),
+                outbounds: Arc::new(parsed_cfg.outbounds),
+                config_generation: 2,
+            }))
+            .unwrap();
+
+        let status_v2 = send_command(&sock_path, "STATUS").await.unwrap();
+        assert!(status_v2.contains(r#""config_generation":2"#));
+
+        let nodes_v2 = send_command(&sock_path, "NODES").await.unwrap();
+        assert!(nodes_v2.contains(r#""reloaded_socks""#));
+
+        let _ = shutdown_tx.send(true);
+        let _ = srv_handle.await;
     }
 }

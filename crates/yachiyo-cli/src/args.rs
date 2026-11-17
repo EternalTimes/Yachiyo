@@ -76,7 +76,7 @@ pub struct CliArgs {
     pub check: bool,
 
     /// Unix domain socket IPC path (default: /tmp/yachiyo.sock).
-    #[arg(long, value_name = "PATH", global = true)]
+    #[arg(long, visible_alias = "socket", value_name = "PATH", global = true)]
     pub ipc_path: Option<PathBuf>,
 
     /// Format query output as raw JSON.
@@ -551,6 +551,11 @@ mod tests {
         assert_eq!(args.query_command(), Some(QueryCommand::Nodes));
         assert_eq!(args.ipc_path, Some(PathBuf::from("/tmp/custom.sock")));
         assert!(args.json);
+
+        let args =
+            CliArgs::try_parse_from(["yachiyo", "status", "--socket", "/tmp/alias.sock"]).unwrap();
+        assert_eq!(args.query_command(), Some(QueryCommand::Status));
+        assert_eq!(args.ipc_path, Some(PathBuf::from("/tmp/alias.sock")));
 
         let args = CliArgs::try_parse_from(["yachiyo", "--status"]).unwrap();
         assert_eq!(args.query_command(), Some(QueryCommand::Status));

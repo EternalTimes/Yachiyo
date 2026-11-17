@@ -100,11 +100,11 @@ pub async fn run() -> ExitCode {
         None => (std::path::PathBuf::from(ipc::DEFAULT_IPC_PATH), false),
     };
 
-    let ipc_server = match ipc::IpcServer::bind_with_fallback(
+    let ipc_server = match ipc::IpcServer::bind_with_snapshot(
         &ipc_path,
         is_custom,
         listener.diagnostics(),
-        Arc::clone(&outbounds),
+        snapshot_tx.subscribe(),
     )
     .await
     {
@@ -123,19 +123,32 @@ pub async fn run() -> ExitCode {
         }
     });
 
-    // 9. Spawn background health checks for outbound groups
-    outbounds.spawn_health_checks(shutdown_rx.clone());
+    // 9. Spawn background health checks scoped to active config generation
+    let initial_hc_guard = reload::spawn_generation_health_checks(&outbounds, shutdown_rx.clone());
 
-    // 9. Spawn SIGHUP config reloader (when --config is provided) and inbound accept loops
-    #[cfg(unix)]
-    if let Some(config_path) = args.config.clone() {
-        reload::spawn_sighup_reloader(
-            config_path,
-            reload_baseline,
-            snapshot_tx,
-            shutdown_rx.clone(),
-        );
-    }
+    // 10. Spawn SIGHUP config reloader (when --config is provided) and inbound accept loops
+    let _cli_mode_hc_guard = {
+        #[cfg(unix)]
+        {
+            if let Some(config_path) = args.config.clone() {
+                reload::spawn_sighup_reloader(
+                    config_path,
+                    reload_baseline,
+                    snapshot_tx,
+                    listener.diagnostics(),
+                    initial_hc_guard,
+                    shutdown_rx.clone(),
+                );
+                None
+            } else {
+                Some(initial_hc_guard)
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Some(initial_hc_guard)
+        }
+    };
     let server_handle = tokio::spawn(async move { listener.run(shutdown_rx).await });
 
     // 9. Coordinate server execution, termination signals, and graceful connection draining

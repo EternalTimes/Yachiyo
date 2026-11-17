@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
-use yachiyo_core::{Config, ConfigError};
+use yachiyo_core::{Config, ConfigError, DiagnosticsTracker, OutboundRegistry};
 use yachiyo_inbound::RuntimeSnapshot;
 
 use crate::args::RuntimeConfig;
@@ -100,12 +100,89 @@ pub fn reload_from_file(
     Ok(next_generation)
 }
 
+/// RAII handle owning background health-check tasks for a single configuration generation.
+///
+/// Dropping or replacing this guard signals all health-check loops of the previous
+/// generation to stop immediately, preventing task accumulation across repeated SIGHUP reloads.
+#[derive(Debug)]
+pub struct HealthCheckGuard {
+    stop_tx: Option<watch::Sender<bool>>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl HealthCheckGuard {
+    /// Signals all generation health-check tasks to stop and awaits their completion.
+    #[allow(dead_code)]
+    pub async fn stop_and_join(mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(true);
+        }
+        for handle in self.handles.drain(..) {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for HealthCheckGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.stop_tx.take() {
+            let _ = tx.send(true);
+        }
+    }
+}
+
+/// Spawns health-check tasks for `outbounds` scoped to both `shutdown_rx` and the returned [`HealthCheckGuard`].
+pub fn spawn_generation_health_checks(
+    outbounds: &Arc<OutboundRegistry>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> HealthCheckGuard {
+    let (hc_tx, hc_rx) = watch::channel(*shutdown_rx.borrow());
+    let handles = outbounds.spawn_health_checks(hc_rx);
+    if handles.is_empty() {
+        return HealthCheckGuard {
+            stop_tx: None,
+            handles,
+        };
+    }
+
+    let (gen_stop_tx, mut gen_stop_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        if *shutdown_rx.borrow() {
+            let _ = hc_tx.send(true);
+            return;
+        }
+        loop {
+            tokio::select! {
+                res = gen_stop_rx.changed() => {
+                    if res.is_err() || *gen_stop_rx.borrow() {
+                        let _ = hc_tx.send(true);
+                        break;
+                    }
+                }
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
+                        let _ = hc_tx.send(true);
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    HealthCheckGuard {
+        stop_tx: Some(gen_stop_tx),
+        handles,
+    }
+}
+
 /// Spawns a background SIGHUP listener that reloads `config_path` until `shutdown_rx` becomes `true`.
 #[cfg(unix)]
 pub fn spawn_sighup_reloader(
     config_path: std::path::PathBuf,
     baseline: ReloadBaseline,
     snapshot_tx: watch::Sender<Arc<RuntimeSnapshot>>,
+    diagnostics: Arc<DiagnosticsTracker>,
+    mut active_hc_guard: HealthCheckGuard,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -124,8 +201,13 @@ pub fn spawn_sighup_reloader(
                 _ = sighup.recv() => {
                     match reload_from_file(&config_path, &baseline, &snapshot_tx) {
                         Ok(generation) => {
+                            diagnostics.set_config_generation(generation);
                             let current_outbounds = Arc::clone(&snapshot_tx.borrow().outbounds);
-                            current_outbounds.spawn_health_checks(shutdown_rx.clone());
+                            drop(active_hc_guard);
+                            active_hc_guard = spawn_generation_health_checks(
+                                &current_outbounds,
+                                shutdown_rx.clone(),
+                            );
                             info!(
                                 generation = generation,
                                 path = %config_path.display(),
@@ -292,5 +374,36 @@ rules:
             ReloadError::RestartRequired { field: "listeners" }
         ));
         assert_eq!(tx.borrow().config_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn test_health_check_guard_cancels_previous_generation_tasks() {
+        let cfg = Config::from_yaml_str(
+            r#"
+schema_version: 1
+outbounds:
+  auto_group:
+    type: url-test
+    outbounds:
+      - DIRECT
+    url: http://127.0.0.1:1/generate_204
+    interval_secs: 60
+    timeout_secs: 1
+rules:
+  - MATCH,auto_group
+"#,
+        )
+        .unwrap();
+
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let outbounds_arc = Arc::new(cfg.outbounds);
+        let guard = spawn_generation_health_checks(&outbounds_arc, shutdown_rx);
+        assert_eq!(guard.handles.len(), 1);
+
+        // Stopping/dropping the generation guard must terminate its health-check loop cleanly
+        // even while process-wide shutdown_rx remains false.
+        tokio::time::timeout(Duration::from_secs(2), guard.stop_and_join())
+            .await
+            .expect("previous generation health-check task should stop promptly on reload");
     }
 }
