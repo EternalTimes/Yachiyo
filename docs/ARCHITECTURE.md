@@ -1,6 +1,6 @@
 # 架构草案
 
-状态：提案。实现语言已按 ADR-001 定为 Rust（2026-11-08），模块与工具链随第一个代码切片落地，见路线图 §3.1。
+状态：M1–M2 显式 TCP 代理链路已落地（`crates/yachiyo-core`、`crates/yachiyo-inbound`、`crates/yachiyo-cli`、`tests`）；UDP、`resolver`（独立 DNS）与 `platform`（macOS TUN，路线 `D05` 待定）属于 M3 提案范围。实现语言已按 ADR-001 定为 Rust（2026-11-08）。
 
 ## 1. 模块与依赖方向
 

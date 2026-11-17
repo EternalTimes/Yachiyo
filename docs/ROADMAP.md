@@ -1,6 +1,11 @@
 # 路线图与首批任务
 
-状态：初稿；更新于 2026-11-08。以下按依赖与验收安排，不是固定发布日期。投入量是单人配合 AI、依赖可以正常获取时的初始工程估计，M0 后重新评估。
+状态：已随 M1–M2 落地更新于 2026-11-18。以下按依赖与验收安排，不是固定发布日期。
+
+- **已完成阶段**：
+  - **M1（`v0.1-alpha`）**：`done`。CLI、原生 YAML 配置、mixed / SOCKS5 / HTTP CONNECT TCP 入站、`DIRECT` / `REJECT` / SOCKS5 TCP 出站、顺序规则及 Tier 1–6 端到端测试均已通过。
+  - **M2（`v0.1` 代码与互通/负载基线）**：`done`（8 小时无人值守浸泡入口已就绪，待挂机跑满）。已完成 `SIGHUP` 原子配置快照热重载、`Selector` / `UrlTest` / `Fallback` 策略组与主动 HTTP 204 探针、Unix 域套接字 IPC 状态与诊断、Trojan TCP 出站（支持 `ca_cert` 严格证书校验）、全量依赖许可审计（见 [DEPENDENCIES.md](DEPENDENCIES.md)）、与独立 `Xray 26.3.27` 服务端互通测试（Tier 9）及四阶段可重复负载基线测量（见 [BENCHMARKS.md](BENCHMARKS.md)）。
+- **下一阶段入口**：**M3（`v0.2`）**——先独立推进 UDP 显式代理与独立 DNS 模块，并并行开展 `YAC-003`（TUN 用户态网络栈许可审查）与 `YAC-004` / `D05`（macOS TUN 路线实验核查，尚未定案）。
 
 ## 1. 里程碑
 
@@ -38,7 +43,7 @@ v0.1 的“可用”限定为已测试的 TCP 显式代理场景；TUN、UDP、�
 
 ### 3.1 第一个代码切片：SOCKS5 / HTTP CONNECT → DIRECT
 
-状态：ready（范围已经用户确认，尚未实现）。所属：M0 验证原型，同时作为 M1 的第一条数据链路。
+状态：`done`（已在 M1 落地并通过 Tier 1–4 端到端测试）。所属：M0 验证原型，同时作为 M1 的第一条数据链路。
 
 范围：
 - 入站：SOCKS5 无认证 CONNECT，支持 IPv4、IPv6、域名三种地址类型；HTTP CONNECT。

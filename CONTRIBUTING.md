@@ -1,6 +1,31 @@
 # 开发与协作规范
 
-状态：初稿。以下为后续实现的默认工作约定。语言已定为 Rust（ADR-001），但尚无代码，因此本文没有可以直接运行的构建命令；第一个代码切片完成后补充并在 CI 验证。
+状态：已随 M1–M2 Rust workspace 落地更新（2026-11-18）。语言按 ADR-001 采用 Rust（MSRV `1.85`）。
+
+## 0. 标准构建与验证命令
+
+提交前在工作区根目录执行以下验证命令：
+
+```bash
+# 1. 代码格式化检查
+cargo fmt --check
+
+# 2. 全工作区静态检查（将警告视为错误）
+cargo clippy --workspace --all-targets -- -D warnings
+
+# 3. 编译 CLI 守护进程并运行全量单元与端到端测试（Tier 1–Tier 9）
+cargo build -p yachiyo-cli
+cargo test --workspace -- --test-threads=4
+
+# 4. 仓库合规、文档本地链接、Python 脚本语法与敏感私钥扫描
+python3 -B scripts/check_repository.py
+
+# 5. M2 负载与热重载基线复现（可选，涉及转发/生命周期改动时运行）
+cargo build --release -p yachiyo-cli
+python3 -B scripts/bench_m2_load.py --mode baseline --bin target/release/yachiyo
+```
+
+提交信息约定采用 **`gitmoji + conventional commit` 中文格式**（例如 `🐛 fix(cli): 修复热重载后 IPC 状态滞后与健康检查任务泄漏`），每次提交聚焦单一职责，不把多项无关功能或修复混入同一提交。
 
 ## 1. 任务和改动范围
 
