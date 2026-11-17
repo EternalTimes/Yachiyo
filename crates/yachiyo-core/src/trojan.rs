@@ -4,6 +4,7 @@
 //! standard binary framing, TLS transport, and credential redaction.
 
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -311,15 +312,204 @@ impl ServerCertVerifier for SkipServerVerification {
     }
 }
 
+/// Maximum permitted size for a custom CA certificate bundle file (2 MiB).
+pub const MAX_CA_CERT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+fn decode_base64_clean(input: &str) -> Result<Vec<u8>, std::io::Error> {
+    let cleaned: Vec<u8> = input
+        .bytes()
+        .filter(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+        .collect();
+
+    if cleaned.is_empty() || cleaned.len() % 4 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid base64 length in PEM certificate",
+        ));
+    }
+
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    let mut out = Vec::with_capacity((cleaned.len() / 4) * 3);
+    let chunks = cleaned.chunks_exact(4);
+    let total_chunks = chunks.len();
+
+    for (idx, chunk) in chunks.enumerate() {
+        let is_last = idx + 1 == total_chunks;
+        let pad = if chunk[3] == b'=' {
+            if !is_last {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unexpected base64 padding before final quantum",
+                ));
+            }
+            if chunk[2] == b'=' { 2 } else { 1 }
+        } else {
+            0
+        };
+
+        if chunk[0] == b'=' || chunk[1] == b'=' || (pad == 0 && chunk[2] == b'=') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "malformed base64 padding in PEM certificate",
+            ));
+        }
+
+        let b0 = val(chunk[0]).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid base64 character in PEM certificate",
+            )
+        })?;
+        let b1 = val(chunk[1]).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid base64 character in PEM certificate",
+            )
+        })?;
+
+        out.push((b0 << 2) | (b1 >> 4));
+
+        if pad < 2 {
+            let b2 = val(chunk[2]).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid base64 character in PEM certificate",
+                )
+            })?;
+            out.push((b1 << 4) | (b2 >> 2));
+
+            if pad == 0 {
+                let b3 = val(chunk[3]).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid base64 character in PEM certificate",
+                    )
+                })?;
+                out.push((b2 << 6) | b3);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Parses one or more X.509 certificates from PEM (`CERTIFICATE` blocks) or raw ASN.1 DER bytes.
+pub fn load_ca_certs_from_bytes(
+    data: &[u8],
+) -> Result<Vec<CertificateDer<'static>>, std::io::Error> {
+    if data.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "CA certificate data cannot be empty",
+        ));
+    }
+
+    if let Ok(text) = std::str::from_utf8(data) {
+        const BEGIN_MARKER: &str = "-----BEGIN CERTIFICATE-----";
+        const END_MARKER: &str = "-----END CERTIFICATE-----";
+
+        if text.contains(BEGIN_MARKER) {
+            let mut certs = Vec::new();
+            let mut rest = text;
+            while let Some(start) = rest.find(BEGIN_MARKER) {
+                let after_begin = &rest[start + BEGIN_MARKER.len()..];
+                let end = after_begin.find(END_MARKER).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unclosed PEM CERTIFICATE block",
+                    )
+                })?;
+                let body = &after_begin[..end];
+                let der = decode_base64_clean(body)?;
+                if der.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "empty DER payload in PEM CERTIFICATE block",
+                    ));
+                }
+                certs.push(CertificateDer::from(der));
+                rest = &after_begin[end + END_MARKER.len()..];
+            }
+            if certs.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "no valid PEM CERTIFICATE blocks found",
+                ));
+            }
+            return Ok(certs);
+        }
+    }
+
+    // Raw ASN.1 DER X.509 Certificate starts with SEQUENCE tag 0x30
+    if data[0] == 0x30 && data.len() >= 4 {
+        return Ok(vec![CertificateDer::from(data.to_vec())]);
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "unrecognized CA certificate format (expected PEM CERTIFICATE or ASN.1 DER)",
+    ))
+}
+
+/// Reads and parses X.509 CA certificates from a PEM or DER file on disk.
+pub fn load_ca_certs_from_file(
+    path: &Path,
+) -> Result<Vec<CertificateDer<'static>>, std::io::Error> {
+    let meta = std::fs::metadata(path)?;
+    if meta.len() > MAX_CA_CERT_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "CA certificate file '{}' exceeds {} byte limit",
+                path.display(),
+                MAX_CA_CERT_FILE_BYTES
+            ),
+        ));
+    }
+    let raw = std::fs::read(path)?;
+    load_ca_certs_from_bytes(&raw)
+}
+
 /// Constructs a cached `rustls::ClientConfig` using `ring` crypto provider and WebPKI roots.
 pub fn build_tls_client_config(
     alpn: &[String],
     skip_cert_verify: bool,
 ) -> Result<Arc<rustls::ClientConfig>, std::io::Error> {
+    build_tls_client_config_with_ca(alpn, skip_cert_verify, &[])
+}
+
+/// Constructs a cached `rustls::ClientConfig` using `ring` crypto provider, WebPKI roots,
+/// and any additional custom X.509 CA certificates.
+pub fn build_tls_client_config_with_ca(
+    alpn: &[String],
+    skip_cert_verify: bool,
+    custom_ca_certs: &[CertificateDer<'static>],
+) -> Result<Arc<rustls::ClientConfig>, std::io::Error> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_safe_default_protocol_versions()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+
+    let mut root_store =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    for cert in custom_ca_certs {
+        root_store.add(cert.clone()).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid CA certificate: {e}"),
+            )
+        })?;
+    }
 
     let mut config = if skip_cert_verify {
         builder
@@ -327,8 +517,6 @@ pub fn build_tls_client_config(
             .with_custom_certificate_verifier(Arc::new(SkipServerVerification::new(provider)))
             .with_no_client_auth()
     } else {
-        let root_store =
-            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         builder
             .with_root_certificates(root_store)
             .with_no_client_auth()
@@ -358,6 +546,8 @@ pub struct TrojanOutboundConfig {
     pub sni: Option<String>,
     /// Configured ALPN protocols (e.g. `["h2", "http/1.1"]`).
     pub alpn: Vec<String>,
+    /// Optional path to custom CA certificate bundle (PEM or DER).
+    pub ca_cert: Option<PathBuf>,
     /// Whether to skip TLS certificate verification.
     pub skip_cert_verify: bool,
     /// Cached TLS client configuration.
@@ -372,6 +562,7 @@ impl fmt::Debug for TrojanOutboundConfig {
             .field("sha224_hex", &"[REDACTED]")
             .field("sni", &self.sni)
             .field("alpn", &self.alpn)
+            .field("ca_cert", &self.ca_cert)
             .field("skip_cert_verify", &self.skip_cert_verify)
             .finish()
     }
@@ -384,6 +575,7 @@ impl PartialEq for TrojanOutboundConfig {
             && self.sha224_hex == other.sha224_hex
             && self.sni == other.sni
             && self.alpn == other.alpn
+            && self.ca_cert == other.ca_cert
             && self.skip_cert_verify == other.skip_cert_verify
     }
 }
@@ -597,6 +789,7 @@ mod tests {
             sha224_hex: sha224_hex_bytes(b"super_secret_password"),
             sni: Some("trojan.example.com".to_string()),
             alpn: vec!["h2".to_string()],
+            ca_cert: None,
             skip_cert_verify: true,
             tls_config,
         };
@@ -606,5 +799,33 @@ mod tests {
         let hex_str = sha224_hex(b"super_secret_password");
         assert!(!debug_str.contains(&hex_str));
         assert!(debug_str.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_ca_cert_loader_pem_der_and_invalid_inputs() {
+        // Empty input rejected
+        assert!(load_ca_certs_from_bytes(b"").is_err());
+        // Unclosed PEM rejected
+        assert!(load_ca_certs_from_bytes(b"-----BEGIN CERTIFICATE-----\nAAAA").is_err());
+        // Malformed base64 rejected
+        assert!(
+            load_ca_certs_from_bytes(
+                b"-----BEGIN CERTIFICATE-----\n@@@\n-----END CERTIFICATE-----"
+            )
+            .is_err()
+        );
+
+        // Valid base64 inside PEM parses to exact DER bytes (0x30, 0x03, 0x02, 0x01, 0x00 -> MAMCAQA=)
+        let pem = b"-----BEGIN CERTIFICATE-----\nMAMCAQA=\n-----END CERTIFICATE-----\n";
+        let certs = load_ca_certs_from_bytes(pem).unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].as_ref(), &[0x30, 0x03, 0x02, 0x01, 0x00]);
+
+        // Raw DER starts with 0x30, parses as 1 cert, but fails X.509 validation in RootCertStore
+        let der = [0x30, 0x03, 0x02, 0x01, 0x00];
+        let der_certs = load_ca_certs_from_bytes(&der).unwrap();
+        assert_eq!(der_certs.len(), 1);
+        let err = build_tls_client_config_with_ca(&[], false, &der_certs).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }
