@@ -18,6 +18,9 @@ pub const DEFAULT_MIXED_ADDR: &str = "127.0.0.1:18484";
 pub const DEFAULT_MIXED_SOCKET_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), 18484));
 
+/// Default local Unix domain socket IPC endpoint.
+pub const DEFAULT_IPC_PATH: &str = "/tmp/yachiyo.sock";
+
 /// Command-line arguments for the Yachiyo proxy binary.
 #[derive(Parser, Debug, Clone, PartialEq, Eq)]
 #[command(
@@ -71,6 +74,65 @@ pub struct CliArgs {
     /// Validate configuration and CLI options, then exit without starting listeners.
     #[arg(long)]
     pub check: bool,
+
+    /// Unix domain socket IPC path (default: /tmp/yachiyo.sock).
+    #[arg(long, value_name = "PATH", global = true)]
+    pub ipc_path: Option<PathBuf>,
+
+    /// Format query output as raw JSON.
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    /// Query daemon runtime status and exit.
+    #[arg(long)]
+    pub status: bool,
+
+    /// Query outbound node health reports and exit.
+    #[arg(long, visible_alias = "health")]
+    pub nodes: bool,
+
+    /// Query active in-flight connection details and exit.
+    #[arg(long, visible_alias = "conns")]
+    pub connections: bool,
+
+    /// Query aggregate traffic statistics and exit.
+    #[arg(long, visible_alias = "traffic")]
+    pub stats: bool,
+
+    /// Ping running daemon and exit.
+    #[arg(long)]
+    pub ping: bool,
+
+    /// Query running daemon via IPC command (e.g. status, health, connections, stats).
+    #[arg(long, value_name = "COMMAND", num_args = 0..=1, default_missing_value = "status")]
+    pub query: Option<String>,
+
+    /// Optional query subcommand.
+    #[command(subcommand)]
+    pub command: Option<QueryCommand>,
+}
+
+/// Optional query subcommands for inspecting running Yachiyo daemon via IPC.
+#[derive(clap::Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum QueryCommand {
+    /// Query daemon runtime status and exit.
+    Status,
+    /// Query outbound node health reports and exit.
+    #[command(alias = "health")]
+    Nodes,
+    /// Query active in-flight connection details and exit.
+    #[command(alias = "conns")]
+    Connections,
+    /// Query aggregate traffic statistics and exit.
+    #[command(alias = "traffic")]
+    Stats,
+    /// Ping running daemon and exit.
+    Ping,
+    /// Query running daemon via IPC.
+    Query {
+        /// Optional command target (default: status).
+        target: Option<String>,
+    },
 }
 
 /// Resolved listener endpoints after evaluating defaults.
@@ -113,6 +175,34 @@ pub fn is_loopback_addr(addr: &SocketAddr) -> bool {
 }
 
 impl CliArgs {
+    /// Determines whether an IPC query subcommand or query flag was invoked.
+    pub fn query_command(&self) -> Option<QueryCommand> {
+        if let Some(cmd) = self.command.clone() {
+            return Some(cmd);
+        }
+        if self.status {
+            return Some(QueryCommand::Status);
+        }
+        if self.nodes {
+            return Some(QueryCommand::Nodes);
+        }
+        if self.connections {
+            return Some(QueryCommand::Connections);
+        }
+        if self.stats {
+            return Some(QueryCommand::Stats);
+        }
+        if self.ping {
+            return Some(QueryCommand::Ping);
+        }
+        if let Some(ref q) = self.query {
+            return Some(QueryCommand::Query {
+                target: Some(q.clone()),
+            });
+        }
+        None
+    }
+
     /// Resolves the effective listener addresses based on CLI inputs and default fallback rules.
     ///
     /// Rules:
@@ -441,5 +531,76 @@ mod tests {
         assert_eq!(config.handshake_timeout, Duration::from_secs(5));
         assert_eq!(config.connect_timeout, Duration::from_secs(7));
         assert_eq!(config.idle_timeout, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn test_query_subcommands_and_flags() {
+        let args = CliArgs::try_parse_from(["yachiyo", "status"]).unwrap();
+        assert_eq!(args.query_command(), Some(QueryCommand::Status));
+        assert_eq!(args.ipc_path, None);
+        assert!(!args.json);
+
+        let args = CliArgs::try_parse_from([
+            "yachiyo",
+            "nodes",
+            "--json",
+            "--ipc-path",
+            "/tmp/custom.sock",
+        ])
+        .unwrap();
+        assert_eq!(args.query_command(), Some(QueryCommand::Nodes));
+        assert_eq!(args.ipc_path, Some(PathBuf::from("/tmp/custom.sock")));
+        assert!(args.json);
+
+        let args = CliArgs::try_parse_from(["yachiyo", "--status"]).unwrap();
+        assert_eq!(args.query_command(), Some(QueryCommand::Status));
+
+        let args = CliArgs::try_parse_from(["yachiyo", "--stats"]).unwrap();
+        assert_eq!(args.query_command(), Some(QueryCommand::Stats));
+
+        let args = CliArgs::try_parse_from(["yachiyo", "--connections"]).unwrap();
+        assert_eq!(args.query_command(), Some(QueryCommand::Connections));
+
+        let args = CliArgs::try_parse_from(["yachiyo", "--ping"]).unwrap();
+        assert_eq!(args.query_command(), Some(QueryCommand::Ping));
+
+        let args = CliArgs::try_parse_from(["yachiyo", "health"]).unwrap();
+        assert_eq!(args.query_command(), Some(QueryCommand::Nodes));
+
+        let args = CliArgs::try_parse_from(["yachiyo", "--health"]).unwrap();
+        assert_eq!(args.query_command(), Some(QueryCommand::Nodes));
+
+        let args = CliArgs::try_parse_from(["yachiyo", "query"]).unwrap();
+        assert_eq!(
+            args.query_command(),
+            Some(QueryCommand::Query { target: None })
+        );
+
+        let args = CliArgs::try_parse_from(["yachiyo", "query", "nodes"]).unwrap();
+        assert_eq!(
+            args.query_command(),
+            Some(QueryCommand::Query {
+                target: Some("nodes".to_string())
+            })
+        );
+
+        let args = CliArgs::try_parse_from(["yachiyo", "--query"]).unwrap();
+        assert_eq!(
+            args.query_command(),
+            Some(QueryCommand::Query {
+                target: Some("status".to_string())
+            })
+        );
+
+        let args = CliArgs::try_parse_from(["yachiyo", "--query", "stats"]).unwrap();
+        assert_eq!(
+            args.query_command(),
+            Some(QueryCommand::Query {
+                target: Some("stats".to_string())
+            })
+        );
+
+        let args = CliArgs::try_parse_from(["yachiyo"]).unwrap();
+        assert_eq!(args.query_command(), None);
     }
 }

@@ -15,6 +15,8 @@ use yachiyo_cli::reload::{self, ReloadBaseline};
 use yachiyo_cli::signal;
 use yachiyo_core::ConfigError;
 
+mod ipc;
+
 #[tokio::main]
 async fn main() -> ExitCode {
     run().await
@@ -25,7 +27,16 @@ pub async fn run() -> ExitCode {
     // 1. Parse command-line arguments via clap
     let args = CliArgs::parse();
 
-    // 2. Resolve configuration from --config <PATH> or CLI flags
+    // 2. If a status/diagnostics query command was specified, execute as IPC client and exit
+    if let Some(query_cmd) = args.query_command() {
+        let ipc_path = args
+            .ipc_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from(ipc::DEFAULT_IPC_PATH));
+        return ipc::run_cli_query(&ipc_path, query_cmd, args.json).await;
+    }
+
+    // 3. Resolve configuration from --config <PATH> or CLI flags
     let runtime = match args.resolve_runtime() {
         Ok(rt) => rt,
         Err(err) => {
@@ -83,7 +94,36 @@ pub async fn run() -> ExitCode {
     // 7. Initialize shutdown notification watch channel
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // 8. Spawn background health checks for outbound groups
+    // 8. Bind IPC server for runtime status and diagnostics inspection
+    let (ipc_path, is_custom) = match args.ipc_path {
+        Some(ref p) => (p.clone(), true),
+        None => (std::path::PathBuf::from(ipc::DEFAULT_IPC_PATH), false),
+    };
+
+    let ipc_server = match ipc::IpcServer::bind_with_fallback(
+        &ipc_path,
+        is_custom,
+        listener.diagnostics(),
+        Arc::clone(&outbounds),
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(err) => {
+            error!(path = %ipc_path.display(), error = %err, "failed to bind IPC socket");
+            eprintln!("Error binding IPC socket {}: {err}", ipc_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    info!(path = %ipc_server.path().display(), "IPC diagnostics server active");
+    let ipc_rx = shutdown_rx.clone();
+    let ipc_handle = tokio::spawn(async move {
+        if let Err(e) = ipc_server.run(ipc_rx).await {
+            tracing::warn!(error = %e, "IPC server stopped with error");
+        }
+    });
+
+    // 9. Spawn background health checks for outbound groups
     outbounds.spawn_health_checks(shutdown_rx.clone());
 
     // 9. Spawn SIGHUP config reloader (when --config is provided) and inbound accept loops
@@ -100,7 +140,7 @@ pub async fn run() -> ExitCode {
 
     // 9. Coordinate server execution, termination signals, and graceful connection draining
     let drain_timeout = runtime.drain_timeout;
-    tokio::select! {
+    let exit_code = tokio::select! {
         server_res = server_handle => {
             match server_res {
                 Ok(Ok(())) => {
@@ -132,5 +172,9 @@ pub async fn run() -> ExitCode {
 
             outcome.exit_code()
         }
-    }
+    };
+
+    let _ = shutdown_tx.send(true);
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(500), ipc_handle).await;
+    exit_code
 }

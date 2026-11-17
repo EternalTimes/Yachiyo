@@ -62,6 +62,12 @@
     - `username`（可选，`string`）：RFC 1929 用户名（1..=255 字节，不可为空）。
     - `password`（可选，`string`）：RFC 1929 密码（1..=255 字节，不可为空）。
     - 约束：`username` 与 `password` 必须同时提供或同时省略；日志与 `Debug` 输出会对 `password` 脱敏。
+  - `type: trojan`（标准 Trojan TCP 出站，M2.2）：基于 TLS 传输的 Trojan 协议。
+    - `server`（必填，`string`）：上游 Trojan 服务端地址（`host:port` 或 `[ipv6]:port`，端口范围 `1..=65535`）。
+    - `password`（必填，`string`）：Trojan 认证密码（经纯 Rust FIPS 180-4 SHA-224 处理为 56 字符十六进制摘要；日志与调试信息中自动脱敏）。
+    - `sni`（可选，`string`）：TLS Server Name Indication（若未指定则默认从 `server` 提取主机名；若是 IP 地址则不发送 SNI）。
+    - `alpn`（可选，`Vec<string>`，默认 `["h2", "http/1.1"]`）：TLS ALPN 协商应用层协议列表。
+    - `skip_cert_verify`（可选，`bool`，默认 `false`）：是否跳过 TLS 证书合法性校验（开发/实验环境使用）。
   - `type: selector`（选择策略组）：静态或手动选择候选节点。
     - `outbounds`（必填，`Vec<string>`）：非空候选出站列表（可引用其他已定义的出站节点或 `DIRECT` / `REJECT`）。
     - `selected`（可选，`string`）：初始激活的目标（若省略则默认取 `outbounds` 首项；若指定则必须存在于 `outbounds` 列表中）。
@@ -107,5 +113,14 @@
 使用 `--config` 启动时，向进程发送 `SIGHUP` 会触发原子快照重载：
 - 可热重载字段：`timeouts.handshake_secs`、`timeouts.connect_secs`、`timeouts.idle_secs`、`outbounds`、`rules`。重载成功后新连接立即使用新快照（`config_generation` 递增），已建立连接继续使用其接入时捕获的旧快照完成。
 - 需重启字段：`listeners`（监听地址）与 `limits.max_connections`。若这些字段发生变化或新配置解析/语义校验失败，本次重载会被拒绝并记录错误日志，**当前运行中的快照保持不变**。`logging.level` 变更同样需要重启才能生效，重载时会记录告警并保留当前日志级别。
+
+### 状态查询与诊断 IPC（M2.1）
+
+守护进程运行时会在默认路径 `/tmp/yachiyo.sock`（或通过 `--socket <path>` 指定）监听 Unix 域套接字，供 CLI 查询实时运行指标与状态：
+- 查询概览状态：`yachiyo status [--socket <path>] [--json]`
+- 查询出站节点与选择组延迟：`yachiyo nodes [--socket <path>] [--json]`
+- 查询当前活跃连接追踪：`yachiyo connections [--socket <path>] [--json]`（严格遵守零载荷策略，脱敏敏感凭证）
+- 查询全局传输遥测统计：`yachiyo stats [--socket <path>] [--json]`
+- 探活探测：`yachiyo ping [--socket <path>]`
 
 参考示例：[config.example.yaml](examples/config.example.yaml)。
