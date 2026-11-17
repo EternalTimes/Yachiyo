@@ -18,8 +18,10 @@ use tokio::time::Instant;
 use tracing::debug;
 
 use crate::address::TargetAddr;
+use crate::forward::OutboundStream;
 use crate::outbound::DirectDialer;
 use crate::socks5_outbound::{Socks5Dialer, Socks5OutboundConfig};
+use crate::trojan::{TrojanDialer, TrojanOutboundConfig};
 
 /// Default health check URL for URL-test and fallback groups (Cloudflare 204 endpoint).
 pub const DEFAULT_HEALTH_CHECK_URL: &str = "http://cp.cloudflare.com/generate_204";
@@ -69,11 +71,12 @@ pub enum ProbeError {
 }
 
 /// Recorded health and latency statistics for an outbound candidate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NodeHealth {
     /// Round-trip time in milliseconds recorded by the most recent check.
     pub latency_ms: Option<u64>,
     /// Timestamp of the last check.
+    #[serde(skip)]
     pub last_checked: Option<Instant>,
     /// Whether the endpoint is considered available.
     pub healthy: bool,
@@ -86,6 +89,69 @@ impl Default for NodeHealth {
             last_checked: None,
             healthy: true, // Optimistically healthy until proven otherwise
         }
+    }
+}
+
+/// Diagnostic health and status report for an outbound node or group.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NodeHealthReport {
+    /// Type of outbound: "direct", "reject", "socks5", "selector", "url-test", "fallback".
+    pub node_type: String,
+    /// Whether the node or group is considered available.
+    pub healthy: bool,
+    /// Round-trip latency in milliseconds if tested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    /// Seconds elapsed since the last health probe check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_checked_secs_ago: Option<u64>,
+    /// Active selected candidate if this is a group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected: Option<String>,
+    /// Candidate outbound names if this is a group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidates: Option<Vec<String>>,
+    /// Remote server target address if this is a proxy dialer node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+}
+
+impl NodeHealthReport {
+    /// Formats the report as a JSON object fragment.
+    pub fn to_json(&self) -> String {
+        let mut fields = Vec::new();
+        fields.push(format!(
+            r#""node_type":"{}""#,
+            crate::diagnostics::escape_json(&self.node_type)
+        ));
+        fields.push(format!(r#""healthy":{}"#, self.healthy));
+        if let Some(latency) = self.latency_ms {
+            fields.push(format!(r#""latency_ms":{latency}"#));
+        }
+        if let Some(secs) = self.last_checked_secs_ago {
+            fields.push(format!(r#""last_checked_secs_ago":{secs}"#));
+        }
+        if let Some(ref sel) = self.selected {
+            fields.push(format!(
+                r#""selected":"{}""#,
+                crate::diagnostics::escape_json(sel)
+            ));
+        }
+        if let Some(ref cands) = self.candidates {
+            let list = cands
+                .iter()
+                .map(|c| format!(r#""{}""#, crate::diagnostics::escape_json(c)))
+                .collect::<Vec<_>>()
+                .join(",");
+            fields.push(format!(r#""candidates":[{list}]"#));
+        }
+        if let Some(ref srv) = self.server {
+            fields.push(format!(
+                r#""server":"{}""#,
+                crate::diagnostics::escape_json(srv)
+            ));
+        }
+        format!("{{{}}}", fields.join(","))
     }
 }
 
@@ -337,6 +403,7 @@ pub enum OutboundTarget {
     Direct,
     Reject,
     Socks5(Socks5OutboundConfig),
+    Trojan(TrojanOutboundConfig),
     Selector(Arc<SelectorGroup>),
     UrlTest(Arc<UrlTestGroup>),
     Fallback(Arc<FallbackGroup>),
@@ -348,6 +415,7 @@ impl PartialEq for OutboundTarget {
             (Self::Direct, Self::Direct) => true,
             (Self::Reject, Self::Reject) => true,
             (Self::Socks5(a), Self::Socks5(b)) => a == b,
+            (Self::Trojan(a), Self::Trojan(b)) => a == b,
             (Self::Selector(a), Self::Selector(b)) => a == b,
             (Self::UrlTest(a), Self::UrlTest(b)) => a == b,
             (Self::Fallback(a), Self::Fallback(b)) => a == b,
@@ -363,6 +431,7 @@ pub enum ResolvedOutbound {
     Direct,
     Reject,
     Socks5(Socks5OutboundConfig),
+    Trojan(TrojanOutboundConfig),
 }
 
 /// Registry storing all named outbounds and groups, providing recursive resolution.
@@ -434,6 +503,9 @@ impl OutboundRegistry {
                 Some(OutboundTarget::Socks5(cfg)) => {
                     return Ok((ResolvedOutbound::Socks5(cfg.clone()), chain));
                 }
+                Some(OutboundTarget::Trojan(cfg)) => {
+                    return Ok((ResolvedOutbound::Trojan(cfg.clone()), chain));
+                }
                 Some(OutboundTarget::Selector(group)) => {
                     current_name = group.select();
                 }
@@ -502,13 +574,9 @@ impl OutboundRegistry {
                                 group.update_health(candidate, res.as_ref().copied());
                             }
 
-                            tokio::select! {
-                                _ = tokio::time::sleep(group.interval) => {}
-                                _ = rx.changed() => {
-                                    if *rx.borrow() {
-                                        break;
-                                    }
-                                }
+                            let _ = tokio::time::timeout(group.interval, rx.changed()).await;
+                            if *rx.borrow() {
+                                break;
                             }
                         }
                     });
@@ -552,13 +620,9 @@ impl OutboundRegistry {
                                 group.update_health(candidate, res.as_ref().copied());
                             }
 
-                            tokio::select! {
-                                _ = tokio::time::sleep(group.interval) => {}
-                                _ = rx.changed() => {
-                                    if *rx.borrow() {
-                                        break;
-                                    }
-                                }
+                            let _ = tokio::time::timeout(group.interval, rx.changed()).await;
+                            if *rx.borrow() {
+                                break;
                             }
                         }
                     });
@@ -569,6 +633,177 @@ impl OutboundRegistry {
         }
 
         handles
+    }
+
+    /// Collects a unified health and status report across all leaf nodes and outbound groups.
+    ///
+    /// Redacts all credentials (passwords, tokens) to prevent sensitive information leakage.
+    pub fn health_report(&self) -> HashMap<String, NodeHealthReport> {
+        let mut report = HashMap::new();
+
+        // Built-in standard endpoints
+        report.insert(
+            "DIRECT".to_string(),
+            NodeHealthReport {
+                node_type: "direct".to_string(),
+                healthy: true,
+                latency_ms: None,
+                last_checked_secs_ago: None,
+                selected: None,
+                candidates: None,
+                server: None,
+            },
+        );
+        report.insert(
+            "REJECT".to_string(),
+            NodeHealthReport {
+                node_type: "reject".to_string(),
+                healthy: true,
+                latency_ms: None,
+                last_checked_secs_ago: None,
+                selected: None,
+                candidates: None,
+                server: None,
+            },
+        );
+
+        for (name, target) in &self.entries {
+            match target {
+                OutboundTarget::Direct => {
+                    report.insert(
+                        name.clone(),
+                        NodeHealthReport {
+                            node_type: "direct".to_string(),
+                            healthy: true,
+                            latency_ms: None,
+                            last_checked_secs_ago: None,
+                            selected: None,
+                            candidates: None,
+                            server: None,
+                        },
+                    );
+                }
+                OutboundTarget::Reject => {
+                    report.insert(
+                        name.clone(),
+                        NodeHealthReport {
+                            node_type: "reject".to_string(),
+                            healthy: true,
+                            latency_ms: None,
+                            last_checked_secs_ago: None,
+                            selected: None,
+                            candidates: None,
+                            server: None,
+                        },
+                    );
+                }
+                OutboundTarget::Socks5(cfg) => {
+                    // Strictly redact passwords/tokens
+                    let server_str =
+                        crate::diagnostics::redact_credentials(&cfg.server.to_string());
+                    report.insert(
+                        name.clone(),
+                        NodeHealthReport {
+                            node_type: "socks5".to_string(),
+                            healthy: true,
+                            latency_ms: None,
+                            last_checked_secs_ago: None,
+                            selected: None,
+                            candidates: None,
+                            server: Some(server_str),
+                        },
+                    );
+                }
+                OutboundTarget::Trojan(cfg) => {
+                    // Strictly redact credentials in server string
+                    let server_str =
+                        crate::diagnostics::redact_credentials(&cfg.server.to_string());
+                    report.insert(
+                        name.clone(),
+                        NodeHealthReport {
+                            node_type: "trojan".to_string(),
+                            healthy: true,
+                            latency_ms: None,
+                            last_checked_secs_ago: None,
+                            selected: None,
+                            candidates: None,
+                            server: Some(server_str),
+                        },
+                    );
+                }
+                OutboundTarget::Selector(group) => {
+                    let sel = group.select();
+                    report.insert(
+                        name.clone(),
+                        NodeHealthReport {
+                            node_type: "selector".to_string(),
+                            healthy: true,
+                            latency_ms: None,
+                            last_checked_secs_ago: None,
+                            selected: if sel.is_empty() { None } else { Some(sel) },
+                            candidates: Some(group.candidates.clone()),
+                            server: None,
+                        },
+                    );
+                }
+                OutboundTarget::UrlTest(group) => {
+                    let sel = group.select();
+                    let snapshot = group.health_snapshot();
+                    let (healthy, latency_ms, last_checked_secs_ago) =
+                        if let Some(record) = snapshot.get(&sel) {
+                            (
+                                record.healthy,
+                                record.latency_ms,
+                                record.last_checked.map(|t| t.elapsed().as_secs()),
+                            )
+                        } else {
+                            (true, None, None)
+                        };
+
+                    report.insert(
+                        name.clone(),
+                        NodeHealthReport {
+                            node_type: "url-test".to_string(),
+                            healthy,
+                            latency_ms,
+                            last_checked_secs_ago,
+                            selected: if sel.is_empty() { None } else { Some(sel) },
+                            candidates: Some(group.candidates.clone()),
+                            server: None,
+                        },
+                    );
+                }
+                OutboundTarget::Fallback(group) => {
+                    let sel = group.select();
+                    let snapshot = group.health_snapshot();
+                    let (healthy, latency_ms, last_checked_secs_ago) =
+                        if let Some(record) = snapshot.get(&sel) {
+                            (
+                                record.healthy,
+                                record.latency_ms,
+                                record.last_checked.map(|t| t.elapsed().as_secs()),
+                            )
+                        } else {
+                            (true, None, None)
+                        };
+
+                    report.insert(
+                        name.clone(),
+                        NodeHealthReport {
+                            node_type: "fallback".to_string(),
+                            healthy,
+                            latency_ms,
+                            last_checked_secs_ago,
+                            selected: if sel.is_empty() { None } else { Some(sel) },
+                            candidates: Some(group.candidates.clone()),
+                            server: None,
+                        },
+                    );
+                }
+            }
+        }
+
+        report
     }
 }
 
@@ -631,12 +866,17 @@ pub async fn probe_leaf(
 ) -> Result<Duration, ProbeError> {
     let start = Instant::now();
 
-    let mut stream = match leaf {
+    let mut stream: OutboundStream = match leaf {
         ResolvedOutbound::Direct => DirectDialer::new(timeout)
             .dial(target_addr)
             .await
+            .map(OutboundStream::from)
             .map_err(ProbeError::Io)?,
         ResolvedOutbound::Socks5(cfg) => Socks5Dialer::dial(cfg, target_addr, timeout)
+            .await
+            .map(OutboundStream::from)
+            .map_err(ProbeError::Io)?,
+        ResolvedOutbound::Trojan(cfg) => TrojanDialer::dial(cfg, target_addr, timeout, None)
             .await
             .map_err(ProbeError::Io)?,
         ResolvedOutbound::Reject => return Err(ProbeError::Rejected),
@@ -849,5 +1089,34 @@ mod tests {
         let (leaf, chain) = registry.resolve_with_chain("my_selector").unwrap();
         assert_eq!(leaf, ResolvedOutbound::Direct);
         assert_eq!(chain, vec!["my_selector", "my_fallback", "DIRECT"]);
+    }
+
+    #[test]
+    fn test_outbound_registry_health_report() {
+        let mut registry = OutboundRegistry::new();
+        let selector = Arc::new(SelectorGroup::new(
+            "auto".to_string(),
+            vec!["DIRECT".to_string(), "REJECT".to_string()],
+            None,
+        ));
+        registry.insert("auto".to_string(), OutboundTarget::Selector(selector));
+
+        let report = registry.health_report();
+        assert!(report.contains_key("DIRECT"));
+        assert!(report.contains_key("REJECT"));
+        assert!(report.contains_key("auto"));
+
+        let auto_report = report.get("auto").unwrap();
+        assert_eq!(auto_report.node_type, "selector");
+        assert_eq!(auto_report.selected, Some("DIRECT".to_string()));
+        assert_eq!(
+            auto_report.candidates,
+            Some(vec!["DIRECT".to_string(), "REJECT".to_string()])
+        );
+
+        let json = auto_report.to_json();
+        assert!(json.contains(r#""node_type":"selector""#));
+        assert!(json.contains(r#""healthy":true"#));
+        assert!(json.contains(r#""selected":"DIRECT""#));
     }
 }

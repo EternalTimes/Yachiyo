@@ -14,9 +14,9 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use yachiyo_core::{
-    ConnMetadata, ConnectionGuard, ConnectionTracker, InboundKind, Network, OutboundRegistry,
-    Policy, ResolvedOutbound, RuleSet, Socks5Dialer, TargetAddr,
-    copy_bidirectional_with_idle_timeout, dial_direct,
+    ConnMetadata, ConnectionGuard, ConnectionTracker, DiagnosticsTracker, InboundKind, Network,
+    OutboundRegistry, OutboundStream, Policy, ResolvedOutbound, RuleSet, Socks5Dialer, TargetAddr,
+    TrojanDialer, copy_bidirectional_with_idle_timeout, dial_direct,
 };
 
 use crate::http::{self, HttpParseError};
@@ -144,6 +144,7 @@ pub struct InboundListener {
     listeners: Vec<(ListenerKind, TcpListener)>,
     snapshot_tx: watch::Sender<Arc<RuntimeSnapshot>>,
     tracker: ConnectionTracker,
+    diagnostics: Arc<DiagnosticsTracker>,
 }
 
 impl InboundListener {
@@ -181,13 +182,38 @@ impl InboundListener {
             ));
         }
 
+        let diagnostics = DiagnosticsTracker::new(tracker.limit());
+        diagnostics.set_config_generation(config.config_generation);
+        for (kind, l) in &listeners {
+            if let Ok(addr) = l.local_addr() {
+                diagnostics.add_listener(format!("{addr} ({kind:?})"));
+            }
+        }
+
         let (snapshot_tx, _) = watch::channel(Arc::new(RuntimeSnapshot::from(&config)));
 
         Ok(Self {
             listeners,
             snapshot_tx,
             tracker,
+            diagnostics,
         })
+    }
+
+    /// Returns a reference to the status and diagnostics tracker.
+    pub fn diagnostics(&self) -> Arc<DiagnosticsTracker> {
+        Arc::clone(&self.diagnostics)
+    }
+
+    /// Replaces the diagnostics tracker on this listener with a custom instance.
+    pub fn with_diagnostics(mut self, diagnostics: Arc<DiagnosticsTracker>) -> Self {
+        self.diagnostics = diagnostics;
+        self
+    }
+
+    /// Sets the diagnostics tracker on this listener.
+    pub fn set_diagnostics(&mut self, diagnostics: Arc<DiagnosticsTracker>) {
+        self.diagnostics = diagnostics;
     }
 
     /// Returns a handle for publishing updated runtime configuration snapshots.
@@ -211,9 +237,10 @@ impl InboundListener {
             let rx = shutdown_rx.clone();
             let snapshot_rx = self.snapshot_tx.subscribe();
             let tracker = self.tracker.clone();
+            let diagnostics = Arc::clone(&self.diagnostics);
 
             join_set.spawn(async move {
-                accept_loop(kind, listener, snapshot_rx, tracker, rx).await;
+                accept_loop(kind, listener, snapshot_rx, tracker, diagnostics, rx).await;
             });
         }
 
@@ -235,6 +262,7 @@ async fn accept_loop(
     listener: TcpListener,
     snapshot_rx: watch::Receiver<Arc<RuntimeSnapshot>>,
     tracker: ConnectionTracker,
+    diagnostics: Arc<DiagnosticsTracker>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -274,8 +302,17 @@ async fn accept_loop(
                 };
 
                 let conn_snapshot = snapshot_rx.borrow().clone();
+                let conn_diagnostics = Arc::clone(&diagnostics);
                 tokio::spawn(async move {
-                    handle_inbound_connection(kind, stream, peer_addr, conn_snapshot, guard).await;
+                    handle_inbound_connection(
+                        kind,
+                        stream,
+                        peer_addr,
+                        conn_snapshot,
+                        guard,
+                        conn_diagnostics,
+                    )
+                    .await;
                 });
             }
             Ok(Err(e)) => {
@@ -338,6 +375,7 @@ async fn handle_inbound_connection(
     peer_addr: SocketAddr,
     config: Arc<RuntimeSnapshot>,
     _guard: ConnectionGuard,
+    diagnostics: Arc<DiagnosticsTracker>,
 ) {
     // Phase 1: Inbound Handshake & Target Extraction (bounded by handshake_timeout)
     let handshake_fut = perform_handshake(kind, &mut stream, peer_addr, &config);
@@ -385,6 +423,18 @@ async fn handle_inbound_connection(
         "rule evaluated"
     );
 
+    let policy_str = match &rule_match.policy {
+        Policy::Direct => "DIRECT".to_string(),
+        Policy::Reject => "REJECT".to_string(),
+        Policy::Outbound(name) => name.clone(),
+    };
+    let _active_guard = diagnostics.register_connection(
+        meta.conn_id,
+        meta.peer_addr,
+        meta.target.clone(),
+        policy_str,
+    );
+
     let dial_res = match &rule_match.policy {
         Policy::Reject => {
             match protocol {
@@ -398,9 +448,13 @@ async fn handle_inbound_connection(
             }
             return;
         }
-        Policy::Direct => dial_direct(&meta.target, config.connect_timeout).await,
+        Policy::Direct => dial_direct(&meta.target, config.connect_timeout)
+            .await
+            .map(OutboundStream::from),
         Policy::Outbound(name) => match config.outbounds.resolve(name) {
-            Ok(ResolvedOutbound::Direct) => dial_direct(&meta.target, config.connect_timeout).await,
+            Ok(ResolvedOutbound::Direct) => dial_direct(&meta.target, config.connect_timeout)
+                .await
+                .map(OutboundStream::from),
             Ok(ResolvedOutbound::Reject) => {
                 match protocol {
                     Protocol::Socks5 => {
@@ -414,7 +468,12 @@ async fn handle_inbound_connection(
                 return;
             }
             Ok(ResolvedOutbound::Socks5(cfg)) => {
-                Socks5Dialer::dial(&cfg, &meta.target, config.connect_timeout).await
+                Socks5Dialer::dial(&cfg, &meta.target, config.connect_timeout)
+                    .await
+                    .map(OutboundStream::from)
+            }
+            Ok(ResolvedOutbound::Trojan(cfg)) => {
+                TrojanDialer::dial(&cfg, &meta.target, config.connect_timeout, None).await
             }
             Err(e) => Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -463,6 +522,7 @@ async fn handle_inbound_connection(
     .await
     {
         Ok(stats) => {
+            diagnostics.record_transfer(stats.client_to_remote, stats.remote_to_client);
             info!(
                 target = %target,
                 client_to_remote = stats.client_to_remote,
@@ -614,6 +674,27 @@ mod tests {
             // Accept loop should terminate promptly
             let res = tokio::time::timeout(Duration::from_secs(1), handle).await;
             assert!(res.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_inbound_listener_diagnostics_tracking() {
+        run_async(async {
+            let config = InboundConfig {
+                mixed_addr: Some("127.0.0.1:0".parse().unwrap()),
+                socks_addr: None,
+                http_addr: None,
+                ..Default::default()
+            };
+            let tracker = ConnectionTracker::new(100);
+            let listener = InboundListener::bind(config, tracker).await.unwrap();
+
+            let diagnostics = listener.diagnostics();
+            assert_eq!(diagnostics.max_connections(), 100);
+            assert_eq!(diagnostics.active_count(), 0);
+            let status = diagnostics.runtime_status();
+            assert!(status.ok);
+            assert!(!status.listeners.is_empty());
         });
     }
 }

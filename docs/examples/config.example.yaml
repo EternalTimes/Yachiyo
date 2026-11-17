@@ -28,11 +28,18 @@ outbounds:
   lab_socks_backup:
     type: socks5
     server: 192.0.2.2:1080
+  lab_trojan_primary:
+    type: trojan
+    server: 192.0.2.3:443
+    password: demo-trojan-password
+    sni: trojan.example.org
+    # skip_cert_verify: false
   auto_group:
     type: url-test
     outbounds:
       - lab_socks_primary
       - lab_socks_backup
+      - lab_trojan_primary
     url: http://cp.cloudflare.com/generate_204
     interval_secs: 300
     timeout_secs: 5

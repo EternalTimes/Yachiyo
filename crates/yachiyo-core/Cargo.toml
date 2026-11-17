@@ -13,6 +13,10 @@ tracing = { workspace = true, features = ["std"] }
 thiserror = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_yml = { workspace = true }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+tokio-rustls = { workspace = true, features = ["ring", "tls12"] }
+rustls-pki-types = { workspace = true, features = ["std"] }
+webpki-roots = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

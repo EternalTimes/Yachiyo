@@ -119,6 +119,16 @@ enum RawOutboundConfig {
         #[serde(default)]
         password: Option<String>,
     },
+    Trojan {
+        server: String,
+        password: String,
+        #[serde(default)]
+        sni: Option<String>,
+        #[serde(default)]
+        alpn: Vec<String>,
+        #[serde(default)]
+        skip_cert_verify: bool,
+    },
     Selector {
         outbounds: Vec<String>,
         #[serde(default)]
@@ -408,7 +418,9 @@ impl Config {
         let mut group_graph: HashMap<String, Vec<String>> = HashMap::new();
         for (name, raw_out) in &raw.outbounds {
             let candidates = match raw_out {
-                RawOutboundConfig::Socks5 { .. } => continue,
+                RawOutboundConfig::Socks5 { .. } | RawOutboundConfig::Trojan { .. } => {
+                    continue;
+                }
                 RawOutboundConfig::Selector { outbounds, .. }
                 | RawOutboundConfig::UrlTest { outbounds, .. }
                 | RawOutboundConfig::Fallback { outbounds, .. } => outbounds,
@@ -544,6 +556,65 @@ impl Config {
                         OutboundTarget::Socks5(Socks5OutboundConfig {
                             server: server_addr,
                             auth,
+                        }),
+                    );
+                }
+                RawOutboundConfig::Trojan {
+                    server,
+                    password,
+                    sni,
+                    alpn,
+                    skip_cert_verify,
+                } => {
+                    let server_addr: TargetAddr =
+                        server.parse().map_err(|e| ConfigError::InvalidOutbound {
+                            name: name.clone(),
+                            reason: format!("invalid server address '{server}': {e}"),
+                        })?;
+                    if server_addr.port == 0 {
+                        return Err(ConfigError::InvalidOutbound {
+                            name,
+                            reason: "server port cannot be 0".to_string(),
+                        });
+                    }
+                    if password.is_empty() {
+                        return Err(ConfigError::InvalidOutbound {
+                            name,
+                            reason: "password cannot be empty".to_string(),
+                        });
+                    }
+                    if let Some(ref s) = sni {
+                        if s.is_empty() {
+                            return Err(ConfigError::InvalidOutbound {
+                                name,
+                                reason: "sni cannot be empty if specified".to_string(),
+                            });
+                        }
+                    }
+                    let alpn = if alpn.is_empty() {
+                        vec!["h2".to_string(), "http/1.1".to_string()]
+                    } else {
+                        alpn
+                    };
+                    let sha224_hex = crate::trojan::sha224_hex_bytes(password.as_bytes());
+                    let tls_config =
+                        crate::trojan::build_tls_client_config(&alpn, skip_cert_verify).map_err(
+                            |e| ConfigError::InvalidOutbound {
+                                name: name.clone(),
+                                reason: format!("failed to build TLS client configuration: {e}"),
+                            },
+                        )?;
+
+                    outbounds.insert(
+                        name,
+                        OutboundTarget::Trojan(crate::trojan::TrojanOutboundConfig {
+                            server: server_addr,
+                            password,
+                            sha224_hex,
+                            sni,
+                            alpn,
+                            skip_cert_verify,
+                            tls_config,
                         }),
                     );
                 }
@@ -763,6 +834,7 @@ fn check_yaml_depth(value: &serde_yml::Value, depth: usize) -> Result<(), Config
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::group::ResolvedOutbound;
 
     #[test]
     fn test_valid_minimal_config_uses_safe_defaults() {
@@ -1036,6 +1108,141 @@ rules:
                 assert!(reason.contains("not present in outbounds list"));
             }
             other => panic!("expected selected not in list error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trojan_config_validation() {
+        let valid = r#"
+schema_version: 1
+outbounds:
+  trojan_node:
+    type: trojan
+    server: trojan.example.com:443
+    password: my-trojan-password
+    sni: custom.sni.example.com
+    alpn: [h2]
+    skip_cert_verify: true
+rules:
+  - MATCH,trojan_node
+"#;
+        let cfg = Config::from_yaml_str(valid).unwrap();
+        match cfg.outbounds.get("trojan_node").unwrap() {
+            OutboundTarget::Trojan(trojan) => {
+                assert_eq!(trojan.server.to_string(), "trojan.example.com:443");
+                assert_eq!(trojan.password, "my-trojan-password");
+                assert_eq!(
+                    trojan.sha224_hex,
+                    crate::trojan::sha224_hex_bytes(b"my-trojan-password")
+                );
+                assert_eq!(trojan.sni.as_deref(), Some("custom.sni.example.com"));
+                assert_eq!(trojan.alpn, vec!["h2".to_string()]);
+                assert!(trojan.skip_cert_verify);
+            }
+            other => panic!("expected OutboundTarget::Trojan, got {other:?}"),
+        }
+
+        // Test default ALPN
+        let default_alpn = r#"
+schema_version: 1
+outbounds:
+  trojan_node:
+    type: trojan
+    server: 192.0.2.1:443
+    password: secret
+rules:
+  - MATCH,trojan_node
+"#;
+        let cfg = Config::from_yaml_str(default_alpn).unwrap();
+        match cfg.outbounds.get("trojan_node").unwrap() {
+            OutboundTarget::Trojan(trojan) => {
+                assert_eq!(trojan.alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
+                assert!(!trojan.skip_cert_verify);
+                assert_eq!(trojan.sni, None);
+            }
+            other => panic!("expected OutboundTarget::Trojan, got {other:?}"),
+        }
+
+        // Empty password rejection
+        let empty_pw = r#"
+schema_version: 1
+outbounds:
+  trojan_node:
+    type: trojan
+    server: 192.0.2.1:443
+    password: ""
+rules:
+  - MATCH,trojan_node
+"#;
+        let err = Config::from_yaml_str(empty_pw).unwrap_err();
+        match err {
+            ConfigError::InvalidOutbound { reason, .. } => {
+                assert!(reason.contains("password cannot be empty"));
+            }
+            other => panic!("expected password cannot be empty, got {other:?}"),
+        }
+
+        // Port 0 rejection
+        let port_0 = r#"
+schema_version: 1
+outbounds:
+  trojan_node:
+    type: trojan
+    server: 192.0.2.1:0
+    password: test
+rules:
+  - MATCH,trojan_node
+"#;
+        let err = Config::from_yaml_str(port_0).unwrap_err();
+        match err {
+            ConfigError::InvalidOutbound { reason, .. } => {
+                assert!(reason.contains("server port cannot be 0"));
+            }
+            other => panic!("expected port 0 error, got {other:?}"),
+        }
+
+        // Empty SNI rejection
+        let empty_sni = r#"
+schema_version: 1
+outbounds:
+  trojan_node:
+    type: trojan
+    server: 192.0.2.1:443
+    password: test
+    sni: ""
+rules:
+  - MATCH,trojan_node
+"#;
+        let err = Config::from_yaml_str(empty_sni).unwrap_err();
+        match err {
+            ConfigError::InvalidOutbound { reason, .. } => {
+                assert!(reason.contains("sni cannot be empty"));
+            }
+            other => panic!("expected empty sni error, got {other:?}"),
+        }
+
+        // Group referencing trojan node
+        let group_ref = r#"
+schema_version: 1
+outbounds:
+  trojan1:
+    type: trojan
+    server: 192.0.2.1:443
+    password: test
+  my_group:
+    type: selector
+    outbounds: [trojan1]
+rules:
+  - MATCH,my_group
+"#;
+        let cfg = Config::from_yaml_str(group_ref).unwrap();
+        let (resolved, chain) = cfg.outbounds.resolve_with_chain("my_group").unwrap();
+        assert_eq!(chain, vec!["my_group", "trojan1"]);
+        match resolved {
+            ResolvedOutbound::Trojan(t) => {
+                assert_eq!(t.server.to_string(), "192.0.2.1:443");
+            }
+            other => panic!("expected ResolvedOutbound::Trojan, got {other:?}"),
         }
     }
 }

@@ -3,11 +3,12 @@
 //! Bidirectional data forwarding kernel with dual-simplex half-close propagation,
 //! HTTP CONNECT initial data preservation, 300s idle timeout, and zero-payload logging.
 
+use std::fmt;
 use std::future::poll_fn;
 use std::pin::Pin;
-use std::task::Poll;
+use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tracing::{debug, warn};
@@ -17,6 +18,73 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Default directional transfer buffer size (8 KB).
 pub const DEFAULT_BUFFER_SIZE: usize = 8192;
+
+/// Bidirectional stream abstraction unifying raw TCP and TLS streams.
+pub enum OutboundStream {
+    Tcp(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl fmt::Debug for OutboundStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tcp(s) => f.debug_tuple("Tcp").field(s).finish(),
+            Self::Tls(_) => f.debug_tuple("Tls").finish(),
+        }
+    }
+}
+
+impl From<TcpStream> for OutboundStream {
+    fn from(s: TcpStream) -> Self {
+        Self::Tcp(s)
+    }
+}
+
+impl From<tokio_rustls::client::TlsStream<TcpStream>> for OutboundStream {
+    fn from(s: tokio_rustls::client::TlsStream<TcpStream>) -> Self {
+        Self::Tls(Box::new(s))
+    }
+}
+
+impl AsyncRead for OutboundStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for OutboundStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
 
 /// Telemetry statistics returned upon forwarding completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -40,7 +108,7 @@ enum ReadEvent {
     Remote(std::io::Result<usize>),
 }
 
-/// Copies data bidirectionally between `client` and `remote` TCP streams until both
+/// Copies data bidirectionally between `client` and `remote` streams until both
 /// directions are closed, an I/O error occurs, or the idle timeout expires.
 ///
 /// # Semantics:
@@ -54,12 +122,13 @@ enum ReadEvent {
 /// - **Privacy**: Zero payload bytes are logged; tracing emits only byte metrics and state events.
 pub async fn copy_bidirectional_with_idle_timeout(
     mut client: TcpStream,
-    mut remote: TcpStream,
+    remote: impl Into<OutboundStream>,
     idle_timeout: Duration,
     initial_outbound_data: Option<&[u8]>,
 ) -> Result<TransferStats, std::io::Error> {
+    let remote = remote.into();
     let (mut client_read, mut client_write) = client.split();
-    let (mut remote_read, mut remote_write) = remote.split();
+    let (mut remote_read, mut remote_write) = tokio::io::split(remote);
 
     let mut client_to_remote = 0u64;
     let mut remote_to_client = 0u64;
