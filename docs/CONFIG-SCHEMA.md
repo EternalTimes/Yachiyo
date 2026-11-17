@@ -65,9 +65,10 @@
   - `type: trojan`（标准 Trojan TCP 出站，M2.2）：基于 TLS 传输的 Trojan 协议。
     - `server`（必填，`string`）：上游 Trojan 服务端地址（`host:port` 或 `[ipv6]:port`，端口范围 `1..=65535`）。
     - `password`（必填，`string`）：Trojan 认证密码（经纯 Rust FIPS 180-4 SHA-224 处理为 56 字符十六进制摘要；日志与调试信息中自动脱敏）。
-    - `sni`（可选，`string`）：TLS Server Name Indication（若未指定则默认从 `server` 提取主机名；若是 IP 地址则不发送 SNI）。
+    - `sni`（可选，`string`）：TLS Server Name Indication（若未指定则默认从 `server` 提取主机名；若是 IP 地址则使用对应 IP 类型 ServerName）。
     - `alpn`（可选，`Vec<string>`，默认 `["h2", "http/1.1"]`）：TLS ALPN 协商应用层协议列表。
-    - `skip_cert_verify`（可选，`bool`，默认 `false`）：是否跳过 TLS 证书合法性校验（开发/实验环境使用）。
+    - `ca_cert`（可选，`string`）：自定义受信任根证书文件路径（支持 PEM `CERTIFICATE` 或 ASN.1 DER 格式，上限 2 MiB），用于在不关闭证书校验的前提下验证自建 CA 或受控测试服务端证书。
+    - `skip_cert_verify`（可选，`bool`，默认 `false`）：是否跳过 TLS 证书合法性校验（仅限受控开发/实验场景显式启用）。
   - `type: selector`（选择策略组）：静态或手动选择候选节点。
     - `outbounds`（必填，`Vec<string>`）：非空候选出站列表（可引用其他已定义的出站节点或 `DIRECT` / `REJECT`）。
     - `selected`（可选，`string`）：初始激活的目标（若省略则默认取 `outbounds` 首项；若指定则必须存在于 `outbounds` 列表中）。
@@ -116,11 +117,11 @@
 
 ### 状态查询与诊断 IPC（M2.1）
 
-守护进程运行时会在默认路径 `/tmp/yachiyo.sock`（或通过 `--socket <path>` 指定）监听 Unix 域套接字，供 CLI 查询实时运行指标与状态：
-- 查询概览状态：`yachiyo status [--socket <path>] [--json]`
-- 查询出站节点与选择组延迟：`yachiyo nodes [--socket <path>] [--json]`
-- 查询当前活跃连接追踪：`yachiyo connections [--socket <path>] [--json]`（严格遵守零载荷策略，脱敏敏感凭证）
-- 查询全局传输遥测统计：`yachiyo stats [--socket <path>] [--json]`
-- 探活探测：`yachiyo ping [--socket <path>]`
+守护进程运行时会在默认路径 `/tmp/yachiyo.sock`（可通过 `--ipc-path <path>` 或别名 `--socket <path>` 指定）监听 Unix 域套接字，供 CLI 查询实时运行指标与状态：
+- 查询概览状态：`yachiyo status [--ipc-path <path>] [--json]`
+- 查询出站节点与选择组延迟：`yachiyo nodes [--ipc-path <path>] [--json]`
+- 查询当前活跃连接追踪：`yachiyo connections [--ipc-path <path>] [--json]`（严格遵守零载荷策略，脱敏敏感凭证）
+- 查询全局传输遥测统计：`yachiyo stats [--ipc-path <path>] [--json]`
+- 探活探测：`yachiyo ping [--ipc-path <path>] [--json]`
 
 参考示例：[config.example.yaml](examples/config.example.yaml)。

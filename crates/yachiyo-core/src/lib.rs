@@ -39,5 +39,6 @@ pub use rule::{IpCidr, Policy, Rule, RuleError, RuleMatch, RuleSet};
 pub use socks5_outbound::{Socks5Auth, Socks5Dialer, Socks5OutboundConfig};
 pub use trojan::{
     SkipServerVerification, TrojanDialer, TrojanOutboundConfig, build_tls_client_config,
-    encode_trojan_header, sha224_digest, sha224_hex, sha224_hex_bytes,
+    build_tls_client_config_with_ca, encode_trojan_header, load_ca_certs_from_bytes,
+    load_ca_certs_from_file, sha224_digest, sha224_hex, sha224_hex_bytes,
 };

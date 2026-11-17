@@ -127,6 +127,8 @@ enum RawOutboundConfig {
         #[serde(default)]
         alpn: Vec<String>,
         #[serde(default)]
+        ca_cert: Option<String>,
+        #[serde(default)]
         skip_cert_verify: bool,
     },
     Selector {
@@ -564,6 +566,7 @@ impl Config {
                     password,
                     sni,
                     alpn,
+                    ca_cert,
                     skip_cert_verify,
                 } => {
                     let server_addr: TargetAddr =
@@ -591,19 +594,44 @@ impl Config {
                             });
                         }
                     }
+                    let (ca_cert_path, custom_ca_certs) = match ca_cert {
+                        Some(path_str) => {
+                            if path_str.is_empty() {
+                                return Err(ConfigError::InvalidOutbound {
+                                    name,
+                                    reason: "ca_cert cannot be empty if specified".to_string(),
+                                });
+                            }
+                            let p = std::path::PathBuf::from(&path_str);
+                            let certs =
+                                crate::trojan::load_ca_certs_from_file(&p).map_err(|e| {
+                                    ConfigError::InvalidOutbound {
+                                        name: name.clone(),
+                                        reason: format!(
+                                            "failed to load ca_cert '{}': {e}",
+                                            p.display()
+                                        ),
+                                    }
+                                })?;
+                            (Some(p), certs)
+                        }
+                        None => (None, Vec::new()),
+                    };
                     let alpn = if alpn.is_empty() {
                         vec!["h2".to_string(), "http/1.1".to_string()]
                     } else {
                         alpn
                     };
                     let sha224_hex = crate::trojan::sha224_hex_bytes(password.as_bytes());
-                    let tls_config =
-                        crate::trojan::build_tls_client_config(&alpn, skip_cert_verify).map_err(
-                            |e| ConfigError::InvalidOutbound {
-                                name: name.clone(),
-                                reason: format!("failed to build TLS client configuration: {e}"),
-                            },
-                        )?;
+                    let tls_config = crate::trojan::build_tls_client_config_with_ca(
+                        &alpn,
+                        skip_cert_verify,
+                        &custom_ca_certs,
+                    )
+                    .map_err(|e| ConfigError::InvalidOutbound {
+                        name: name.clone(),
+                        reason: format!("failed to build TLS client configuration: {e}"),
+                    })?;
 
                     outbounds.insert(
                         name,
@@ -613,6 +641,7 @@ impl Config {
                             sha224_hex,
                             sni,
                             alpn,
+                            ca_cert: ca_cert_path,
                             skip_cert_verify,
                             tls_config,
                         }),
@@ -1243,6 +1272,45 @@ rules:
                 assert_eq!(t.server.to_string(), "192.0.2.1:443");
             }
             other => panic!("expected ResolvedOutbound::Trojan, got {other:?}"),
+        }
+
+        // Empty or nonexistent ca_cert rejected
+        let empty_ca = r#"
+schema_version: 1
+outbounds:
+  trojan_node:
+    type: trojan
+    server: 192.0.2.1:443
+    password: test
+    ca_cert: ""
+rules:
+  - MATCH,trojan_node
+"#;
+        let err = Config::from_yaml_str(empty_ca).unwrap_err();
+        match err {
+            ConfigError::InvalidOutbound { reason, .. } => {
+                assert!(reason.contains("ca_cert cannot be empty"));
+            }
+            other => panic!("expected empty ca_cert error, got {other:?}"),
+        }
+
+        let missing_ca = r#"
+schema_version: 1
+outbounds:
+  trojan_node:
+    type: trojan
+    server: 192.0.2.1:443
+    password: test
+    ca_cert: /nonexistent/path/to/ca.pem
+rules:
+  - MATCH,trojan_node
+"#;
+        let err = Config::from_yaml_str(missing_ca).unwrap_err();
+        match err {
+            ConfigError::InvalidOutbound { reason, .. } => {
+                assert!(reason.contains("failed to load ca_cert"));
+            }
+            other => panic!("expected missing ca_cert error, got {other:?}"),
         }
     }
 }
