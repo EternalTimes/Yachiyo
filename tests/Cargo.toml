@@ -44,7 +44,18 @@ path = "tier7_config_reload.rs"
 name = "tier8_outbound_groups"
 path = "tier8_outbound_groups.rs"
 
+[[test]]
+name = "tier9_trojan_and_ipc"
+path = "tier9_trojan_and_ipc.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "process", "macros"] }
 libc = { version = "0.2", optional = false }
+
+[dev-dependencies]
+yachiyo-core = { path = "../crates/yachiyo-core" }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+tokio-rustls = { workspace = true, features = ["ring", "tls12"] }
+rustls-pki-types = { workspace = true, features = ["std"] }
+ring = { workspace = true, features = ["std"] }
 

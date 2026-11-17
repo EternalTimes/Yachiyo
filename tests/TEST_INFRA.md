@@ -128,6 +128,25 @@ An in-process asynchronous TCP server that acts as the target server for proxy f
 - `test_tokio_multithreaded_clients`: High concurrency simulated browser/application clients running parallel sessions.
 - `test_zero_payload_logging_audit`: Scans proxy stdout/stderr logs across all operations to ensure zero payload content is leaked.
 
+### Tier 5 — Native YAML Config, Sequential Rules & REJECT (`tier5_config_rules.rs`)
+- Validates `--config` & `--check` CLI paths, `DOMAIN`, `DOMAIN-SUFFIX`, `IP-CIDR` (`no-resolve`), and `REJECT` replies (`0x02` for SOCKS5, `403 Forbidden` for HTTP CONNECT).
+
+### Tier 6 — SOCKS5 TCP Outbound (`tier6_socks5_outbound.rs`)
+- Validates upstream SOCKS5 no-auth (`0x00`) & RFC 1929 username/password (`0x02`) dialing, failure handling, and password redaction.
+
+### Tier 7 — SIGHUP Atomic Config Snapshot Reload (`tier7_config_reload.rs`)
+- Validates live `SIGHUP` snapshot switching while in-flight connections continue uninterrupted on their captured prior snapshot, and preservation of active state on invalid reload configs.
+
+### Tier 8 — Outbound Selection Groups & Health Probing (`tier8_outbound_groups.rs`)
+- Validates `selector`, `fallback`, and `url-test` groups with HTTP 204 health probing and hysteresis tolerance.
+
+### Tier 9 — Trojan TCP Outbound, IPC Diagnostics & Independent Server Interop (`tier9_trojan_and_ipc.rs`)
+- `test_trojan_strict_tls_forwarding_and_half_close`: Ephemeral ECDSA P-256 Root CA + SAN leaf (`trojan.example.org`), `skip_cert_verify: false` + `ca_cert`, SOCKS5 IPv4/Domain, HTTP CONNECT pipelined payload, and client `shutdown()` FIN half-close over TLS.
+- `test_trojan_tls_certificate_and_sni_verification_enforced`: Rejects untrusted cert when `skip_cert_verify: false`, rejects SNI mismatch, and verifies explicit `skip_cert_verify: true`.
+- `test_trojan_wrong_password_and_fallback_group_failover`: Rejects wrong SHA-224 Trojan credentials and fails over to healthy Trojan node via active HTTP 204 health check over TLS.
+- `test_ipc_diagnostics_cli_queries_reload_and_redaction`: Exercises `ping`, `status` (`--ipc-path` / `--socket`), live in-flight `connections`, `stats` byte telemetry, `SIGHUP` reload generation/node sync, socket unlink on `SIGINT`, and zero-payload/credential redaction audit.
+- `test_trojan_independent_xray_server_interop`: When an independent `xray` binary is installed on the host, verifies real-world Trojan TLS + Freedom outbound interop and half-close with `skip_cert_verify: false`.
+
 ---
 
 ## 4. Authoritative Output Derivation Table

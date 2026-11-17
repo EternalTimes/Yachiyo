@@ -632,7 +632,12 @@ name = "yachiyo-e2e"
 version = "0.1.0-alpha.0"
 dependencies = [
  "libc",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
+ "yachiyo-core",
 ]
 
 [[package]]
