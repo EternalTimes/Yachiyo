@@ -157,6 +157,12 @@ impl ProxyProcess {
 
     /// Try to run proxy with expecting an immediate failure (e.g. non-loopback without --allow-lan).
     pub async fn run_expecting_failure(args: &[&str]) -> Result<std::process::Output, String> {
+        Self::run_cli(args).await
+    }
+
+    /// Invoke the `yachiyo` binary as a short-lived CLI command (e.g. `--check` or IPC queries)
+    /// and return its captured stdout/stderr/status.
+    pub async fn run_cli(args: &[&str]) -> Result<std::process::Output, String> {
         let bin_path = find_yachiyo_binary()?;
         let output = Command::new(&bin_path)
             .args(args)
