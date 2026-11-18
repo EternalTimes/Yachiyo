@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+
+[package]
+name = "yachiyo-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "yachiyo_e2e"
+path = "common/mod.rs"
+
+[[test]]
+name = "tier1_feature_coverage"
+path = "tier1_feature_coverage.rs"
+
+[[test]]
+name = "tier2_boundary_corner"
+path = "tier2_boundary_corner.rs"
+
+[[test]]
+name = "tier3_cross_feature"
+path = "tier3_cross_feature.rs"
+
+[[test]]
+name = "tier4_real_world"
+path = "tier4_real_world.rs"
+
+[[test]]
+name = "tier5_config_rules"
+path = "tier5_config_rules.rs"
+
+[[test]]
+name = "tier6_socks5_outbound"
+path = "tier6_socks5_outbound.rs"
+
+[[test]]
+name = "tier7_config_reload"
+path = "tier7_config_reload.rs"
+
+[[test]]
+name = "tier8_outbound_groups"
+path = "tier8_outbound_groups.rs"
+
+[[test]]
+name = "tier9_trojan_and_ipc"
+path = "tier9_trojan_and_ipc.rs"
+
+[dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync", "process", "macros"] }
+libc = { version = "0.2", optional = false }
+
+[dev-dependencies]
+yachiyo-core = { path = "../crates/yachiyo-core" }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+tokio-rustls = { workspace = true, features = ["ring", "tls12"] }
+rustls-pki-types = { workspace = true, features = ["std"] }
+ring = { workspace = true, features = ["std"] }
+

@@ -20,9 +20,42 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
       - name: Check repository documents and infrastructure
         run: python3 -B scripts/check_repository.py
+
+  rust-checks:
+    name: Rust checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: Check repository documents and infrastructure
+        run: python3 -B scripts/check_repository.py
+
+      - name: Check formatting (cargo fmt)
+        run: cargo fmt --check
+
+      - name: Lint with Clippy (cargo clippy)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace tests (cargo test)
+        run: cargo test --workspace

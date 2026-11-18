@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Project Yachiyo 原生配置虚构样例（仅使用 RFC 2606 / RFC 5737 / RFC 3849 文档地址）
+
+schema_version: 1
+
+listeners:
+  mixed: 127.0.0.1:18484
+  allow_lan: false
+
+timeouts:
+  handshake_secs: 10
+  connect_secs: 10
+  idle_secs: 300
+  drain_secs: 5
+
+limits:
+  max_connections: 1024
+
+logging:
+  level: info
+
+outbounds:
+  lab_socks_primary:
+    type: socks5
+    server: 192.0.2.1:1080
+    # username: demo-user
+    # password: demo-password
+  lab_socks_backup:
+    type: socks5
+    server: 192.0.2.2:1080
+  lab_trojan_primary:
+    type: trojan
+    server: 192.0.2.3:443
+    password: demo-trojan-password
+    sni: trojan.example.org
+    # skip_cert_verify: false
+  auto_group:
+    type: url-test
+    outbounds:
+      - lab_socks_primary
+      - lab_socks_backup
+      - lab_trojan_primary
+    url: http://cp.cloudflare.com/generate_204
+    interval_secs: 300
+    timeout_secs: 5
+    tolerance_ms: 50
+  proxy_selector:
+    type: selector
+    outbounds:
+      - auto_group
+      - lab_socks_primary
+      - DIRECT
+    selected: auto_group
+
+rules:
+  - DOMAIN,ads.example.com,REJECT
+  - DOMAIN-SUFFIX,blocked.example.org,REJECT
+  - DOMAIN-SUFFIX,corp.example.com,proxy_selector
+  - IP-CIDR,192.0.2.0/24,REJECT,no-resolve
+  - IP-CIDR,2001:db8::/32,REJECT,no-resolve
+  - MATCH,DIRECT

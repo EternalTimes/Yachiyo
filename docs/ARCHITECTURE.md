@@ -1,6 +1,6 @@
 # 架构草案
 
-状态：提案。语言尚未定案；建议先以 Go 验证 M0 原型，Rust 作为对照方案。M0 通过 ADR-001 决定后，才落地模块和工具链。
+状态：M1–M2 显式 TCP 代理链路已落地（`crates/yachiyo-core`、`crates/yachiyo-inbound`、`crates/yachiyo-cli`、`tests`）；UDP、`resolver`（独立 DNS）与 `platform`（macOS TUN，路线 `D05` 待定）属于 M3 提案范围。实现语言已按 ADR-001 定为 Rust（2026-11-08）。
 
 ## 1. 模块与依赖方向
 

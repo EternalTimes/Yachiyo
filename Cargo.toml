@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/yachiyo-core",
+    "crates/yachiyo-inbound",
+    "crates/yachiyo-cli",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0-alpha.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-only"
+repository = "https://github.com/EternalTimes/Yachiyo"
+authors = ["Project Yachiyo Contributors"]
+
+[workspace.dependencies]
+tokio = { version = "1.43", default-features = false }
+tracing = { version = "0.1", default-features = false }
+tracing-subscriber = { version = "0.3", default-features = false }
+clap = { version = "4.5", default-features = false }
+thiserror = { version = "2.0", default-features = false }
+serde = { version = "1.0", default-features = false }
+serde_yml = { version = "0.0.13", default-features = false }
+rustls = { version = "0.23", default-features = false }
+tokio-rustls = { version = "0.26", default-features = false }
+rustls-pki-types = { version = "1", default-features = false }
+webpki-roots = { version = "0.26", default-features = false }
+ring = { version = "0.17", default-features = false }
